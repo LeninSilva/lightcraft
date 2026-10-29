@@ -62,7 +62,14 @@ fn check_bindgen(want: &str) -> Result<(), String> {
 
 pub fn run(args: &[&str]) -> Result<(), String> {
     let dev = args.contains(&"--dev");
-    if let Some(bad) = args.iter().copied().find(|a| a != "--dev") {
+    let mut bad: Option<&str> = None;
+    for arg in args {
+        if *arg != "--dev" {
+            bad = Some(*arg);
+            break;
+        }
+    }
+    if let Some(bad) = bad {
         return Err(format!("unknown argument `{bad}` (only `--dev` is supported; serve the output with any static HTTP server)"));
     }
 
