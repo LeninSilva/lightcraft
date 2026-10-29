@@ -16,7 +16,7 @@
 //! the folder with any static HTTP server for a browser smoke test.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::{cargo, metadata, root, run as step};
@@ -62,7 +62,7 @@ fn check_bindgen(want: &str) -> Result<(), String> {
 
 pub fn run(args: &[&str]) -> Result<(), String> {
     let dev = args.contains(&"--dev");
-    if let Some(bad) = args.iter().find(|a| *a != "--dev") {
+    if let Some(bad) = args.iter().copied().find(|a| a != "--dev") {
         return Err(format!("unknown argument `{bad}` (only `--dev` is supported; serve the output with any static HTTP server)"));
     }
 
