@@ -72,7 +72,7 @@ fn nav_buttons(app: &mut LightcraftApp, ui: &mut egui::Ui, search_left: f32) {
         if icon_button(ui, "back", Icon::Back, vec2(30.0, 30.0), false, true, crate::i18n::tr("Back")).clicked() {
             let _ = app.run("view.back", json!({}));
         }
-        icon_button(ui, "forward", Icon::Forward, vec2(30.0, 30.0), false, false, crate::i18n::tr("Forward"));
+        // No Forward button: there is no view.forward command, so the icon was dead.
         if !app.native_menu {
             // no native menu bar (web, Windows, Linux): menus in the top bar
             ui.add_space(10.0);

@@ -114,13 +114,18 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 .fold(0.0, f32::max)
         };
         let (cols, tile, size) = tile_layout(ui.available_width(), widest);
+        // Object/Describe need the SAM model, which the web build does not
+        // include: tapping them explains that instead of failing in the engine.
+        let ai_available = lightcraft_engine::segment::Segmenter::AVAILABLE;
         egui::Grid::new("mask-tiles").spacing(vec2(TILE_GAP, TILE_GAP)).show(ui, |ui| {
             for (i, (kind, label, icon)) in tiles.iter().enumerate() {
+                let ai_kind = matches!(*kind, "object" | "prompt");
                 let (r, resp) = ui.allocate_exact_size(vec2(tile, 52.0), Sense::click());
                 crate::widgets::announce(&resp, crate::i18n::tr(label));
                 register(ui, format!("maskNew:{kind}"), r);
                 ui.painter().rect_filled(r, 4.0, if resp.hovered() { t.hover } else { t.inset });
-                paint(ui.painter(), Rect::from_center_size(r.center() - vec2(0.0, 7.0), vec2(20.0, 20.0)), *icon, t.text_label);
+                let icon_color = if !ai_kind || ai_available { t.text_label } else { t.text_disabled };
+                paint(ui.painter(), Rect::from_center_size(r.center() - vec2(0.0, 7.0), vec2(20.0, 20.0)), *icon, icon_color);
                 // (cut short only in a panel too narrow for the label: the full name on hover)
                 let label = crate::i18n::tr(label);
                 let g = one_line(ui.painter(), label, t.font(size), t.text_dim, tile - 2.0 * TILE_PAD);
@@ -130,6 +135,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 ui.painter().galley(at, g, t.text_dim);
                 let resp = if elided { resp.on_hover_text(label) } else { resp };
                 if resp.clicked() {
+                    if ai_kind && !ai_available {
+                        app.toast(ui.ctx(), crate::i18n::tr("AI masks are not available in this build"));
+                    } else {
                     match *kind {
                         "colorRange" => {
                             // an empty colour range; clicking the photo samples it
@@ -149,6 +157,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                         k => {
                             let _ = app.run("mask.add", json!({"kind": k}));
                         }
+                    }
                     }
                 }
                 if i % cols == cols - 1 {

@@ -113,11 +113,15 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             let r = ui.checkbox(&mut app.ui.preset_thumbs, crate::i18n::tr("Show Thumbnails"));
             register(ui, "presetMenu:thumbnails", r.rect);
             ui.separator();
-            if ui.button(crate::i18n::tr("Import Presets…")).clicked() {
+            // Import/export need a host file dialog; on web both services are
+            // unset, so disable instead of failing with a no-dialog error.
+            let can_import = app.services.pick_preset_files.is_some();
+            if ui.add_enabled(can_import, egui::Button::new(crate::i18n::tr("Import Presets…"))).clicked() {
                 let _ = app.run("file.importPresets", json!({}));
             }
             let any_user = app.session.presets.iter().any(|p| !p.builtin);
-            if ui.add_enabled(any_user, egui::Button::new(crate::i18n::tr("Export User Presets…"))).clicked() {
+            let can_export = any_user && app.services.save_preset_file.is_some();
+            if ui.add_enabled(can_export, egui::Button::new(crate::i18n::tr("Export User Presets…"))).clicked() {
                 let _ = app.run("file.exportPresets", json!({}));
             }
         });
