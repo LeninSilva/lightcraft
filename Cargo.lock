@@ -3852,6 +3852,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightcraft-mobile"
+version = "0.15.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "js-sys",
+ "lightcraft-codecs",
+ "lightcraft-color",
+ "lightcraft-develop",
+ "lightcraft-geom",
+ "lightcraft-pipeline",
+ "lightcraft-raster",
+ "lightcraft-scenes",
+ "log",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "lightcraft-pipeline"
 version = "0.15.0"
 dependencies = [

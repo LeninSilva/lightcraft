@@ -1,0 +1,39 @@
+[package]
+name = "lightcraft-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "LightCraft Mobile: a touch-first photo editor on the LightCraft pipeline, compiled to WASM for the Android app (build with `cargo xtask mobile`)"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lightcraft-develop = { workspace = true }
+lightcraft-pipeline = { workspace = true }
+lightcraft-codecs = { workspace = true }
+lightcraft-raster = { workspace = true }
+lightcraft-geom = { workspace = true }
+lightcraft-color = { workspace = true }
+egui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { workspace = true, features = ["default_fonts", "glow"] }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = ["Document", "Element", "HtmlCanvasElement", "HtmlElement", "Window", "Performance"] }
+
+[features]
+# Open HEIC/HEIF photos (see apps/lightcraft-web: the distributor's call because of HEVC patents).
+heif = ["lightcraft-codecs/heif"]
+
+[dev-dependencies]
+lightcraft-scenes = { workspace = true }
