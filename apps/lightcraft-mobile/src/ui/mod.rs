@@ -431,7 +431,7 @@ impl App {
             .photo(id)
             .map(|e| e.name.clone())
             .unwrap_or_else(|| name.clone());
-        self.open_entry(Some(id), None, id, display_name, bytes, photo, Recipe::default());
+        self.open_entry(Some(id), None, id, display_name.clone(), bytes, photo, Recipe::default());
         self.set_status(format!("Opened {display_name}."), false);
     }
 
