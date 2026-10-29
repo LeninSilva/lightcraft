@@ -607,7 +607,7 @@ mod tests {
         let img = Rgb32f::from_fn(32, 32, |_, _| [0.5, 0.5, 0.5]);
         let a = analyze(&img);
         assert_eq!(a.entropy, 0.0);
-        assert_eq!(a.contrast, 0.0);
+        assert!(a.contrast.abs() < 1e-12, "contrast {}", a.contrast);
         assert!((a.p50 - 0.735).abs() < 0.01, "p50 {}", a.p50);
         assert_eq!(a.clipped_highlights, 0.0);
         assert_eq!(a.clipped_shadows, 0.0);
