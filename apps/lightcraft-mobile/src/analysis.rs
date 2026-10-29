@@ -371,8 +371,8 @@ fn saliency_grid(width: usize, height: usize, luma: &[f64], display: &[[f64; 3]]
             }
         }
     }
-    let mut raw = vec![0.0; cells.len()];
-    let mut peak = 0.0;
+    let mut raw: Vec<f64> = vec![0.0; cells.len()];
+    let mut peak: f64 = 0.0;
     for (idx, cell) in cells.iter().enumerate() {
         let cx = idx % gw;
         let cy = idx / gw;
