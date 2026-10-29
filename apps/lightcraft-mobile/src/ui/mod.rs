@@ -29,6 +29,8 @@
 //!   inside host event handling, which has no `egui::Context`.
 
 pub mod host;
+#[cfg(target_arch = "wasm32")]
+pub mod storage;
 
 use std::collections::HashMap;
 use std::sync::Arc;

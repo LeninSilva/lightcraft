@@ -2,11 +2,8 @@
 //! load blobs, save a file where the user can find it, share) is a [`HostRequest`]; answers come
 //! back later as [`HostEvent`]s the app drains every frame. [`WebHost`] implements it with the
 //! browser (file picker, OPFS with an IndexedDB fallback, download export; see
-//! [`storage`]); sharing is not wired yet and answers [`HostEvent::Failed`]. Tests use
+//! [`crate::ui::storage`]); sharing is not wired yet and answers [`HostEvent::Failed`]. Tests use
 //! [`MemoryHost`].
-
-#[cfg(target_arch = "wasm32")]
-mod storage;
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -114,7 +111,8 @@ fn safe_file_name(name: &str) -> &str {
 
 #[cfg(target_arch = "wasm32")]
 mod web_host {
-    use super::{Host, HostEvent, HostRequest, safe_file_name, storage::Backend};
+    use super::{Host, HostEvent, HostRequest, safe_file_name};
+    use crate::ui::storage::Backend;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
