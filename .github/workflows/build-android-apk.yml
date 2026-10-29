@@ -59,8 +59,14 @@ jobs:
         run: |
           mkdir -p www resources
           cp -r target/web-site/. www/
+          # cargo xtask web also writes .gz/.br copies of every bundle file.
+          # Android's asset merger treats foo.js and foo.js.gz as duplicate
+          # resources and fails mergeDebugAssets, so drop the precompressed
+          # copies here. The plain files are what the WebView loads.
+          rm -f www/*.gz www/*.br
           cp assets/app-icon/lightcraft-1024.png resources/icon.png
           test -f www/lightcraft_web_bg.wasm
+          test ! -e www/lightcraft_web.js.gz
 
       - name: Install Capacitor and create the Android shell
         run: |
