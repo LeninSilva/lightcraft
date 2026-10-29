@@ -48,17 +48,39 @@ the first check.
 - Host boundary, native side: `MemoryHost` is unchanged, and `safe_file_name`
   (download-name sanitising) plus a `MemoryHost` round-trip have native tests in
   `host.rs`, so the boundary stays testable without a browser.
+- Share (`WebHost`, wasm32 only): the Web Share API with files. When the browser
+  has no share API or cannot share files, the file is downloaded instead and the
+  answer is `Saved` (Downloads). A cancelled or rejected share answers `Failed`
+  with the real reason ("Sharing was cancelled." / "Sharing failed (…)."). The
+  decision helpers are pure and tested natively in `host.rs`.
+- Browser storage requests persistence best effort (`navigator.storage.persist()`,
+  mirroring the desktop web app) when the backend opens; a refusal never fails
+  opening. See `storage.rs`.
+- Composition (`recipe.rs`): `blend()` now interpolates grading hues along the
+  shortest arc with the strength (previously they snapped to the look's hue at
+  any strength above zero), plus grading blending/balance, grain size/roughness,
+  vignette shape and the remaining detail fields; the focus mask radius is
+  converted from a long-edge fraction to normalized radii so the focus area is
+  round on non-square photos; the Fade curve is clamped to the tone range; and
+  black-and-white keeps both saturation and vibrance at or below zero. Preview,
+  look thumbnails and export all use the same `compose()` path (thumbnails render
+  the small proxy, the preview the working copy; grain is resolution-scaled by
+  the pipeline, so the two agree).
 
 ## Stubbed / not implemented
 
-- `Share` in `WebHost` always answers `Failed` ("not available in this build yet;
-  save the file first"). No Capacitor Share plugin and no Web Share API call.
 - No `?store=` URL override (the desktop web app has `?store=idb`/`?store=memory`).
   Storage is always OPFS-first, IndexedDB fallback.
-- No persistent-storage request (`navigator.storage.persist()`), no tab lock, no
-  render workers: preview renders run on the main thread and block the UI while
-  they run. The draft-while-dragging / full-on-release rendering split is a UI
-  piece, not done here.
+- No tab lock: two tabs could open the same OPFS store. Porting the desktop
+  app's tab lock needs its single-tab semantics and is left for later; phones
+  normally run one instance.
+- No render workers: preview renders run on the main thread and block the UI
+  while they run. Workers need a `worker.js` plus a message protocol ported from
+  the desktop web app; the draft-while-dragging / full-on-release split in the
+  UI already limits the cost, and is the reason workers were not added here.
+- No tap-to-place subject and no pinch/double-tap zoom: both need gesture wiring
+  in the UI, which was out of scope for this integration pass. The UI states
+  both plainly in the Focus and Crop panels.
 - No native (non-WASM) host: on a desktop build the crate has no entry point, by
   design. Native runs use `MemoryHost` in tests only.
 - No signing, no Play Store release: debug APK only, as in the desktop-port build.
@@ -95,3 +117,24 @@ the first check.
 6. Download in the Capacitor WebView: confirm the export actually lands in
    Downloads (the anchor-download path is proven in a desktop browser, not in
    this WebView shell).
+7. Share: tapping Share opens the system share sheet with the full-resolution
+   JPEG; in a WebView without file sharing, the file downloads instead. Cancelling
+   the sheet shows "Could not share: Sharing was cancelled.", not a generic error.
+
+## Ordering and recovery (bug-fix pass, uncompiled locally)
+
+- Storage requests run through one sequential worker in `WebHost`, in queue
+  order, so a stale index write cannot land after a newer one. Requests sent
+  before the backend opens wait in the same queue.
+- The library index is parsed strictly: a corrupt stored index keeps the
+  in-memory library, tries the backup copy (`library/index-backup.json`,
+  written alongside every good index), and blocks index writes until a
+  readable index loads, so a corrupt index is never overwritten with an
+  empty one.
+- Add photo has no picker-open guard (a cancelled browser pick fires no
+  event, which used to deadlock it); the picker answers `PickCancelled` on
+  every failure path that can produce one.
+- Export/share file names carry the photo id, version number and export
+  time, so repeated exports do not overwrite each other in Downloads.
+- A failed full-resolution decode is an export error, never a silent
+  low-resolution proxy export.

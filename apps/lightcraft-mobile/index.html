@@ -24,7 +24,16 @@
   <script type="module">
     import init, { start } from "./lightcraft_mobile.js";
     (async () => {
-      const module = await WebAssembly.compileStreaming(fetch("./lightcraft_mobile_bg.wasm"));
+      // Streaming compile needs the right MIME type; a host that serves
+      // .wasm as application/octet-stream makes it reject a valid module,
+      // so fall back to fetching the bytes and compiling them directly.
+      let module;
+      try {
+        module = await WebAssembly.compileStreaming(fetch("./lightcraft_mobile_bg.wasm"));
+      } catch (_) {
+        const res = await fetch("./lightcraft_mobile_bg.wasm");
+        module = await WebAssembly.compile(await res.arrayBuffer());
+      }
       await init({ module_or_path: module });
       start();
     })().catch((e) => {

@@ -59,6 +59,9 @@ web-sys = { workspace = true, features = [
     "IdbVersionChangeEvent",
     "Navigator",
     "Performance",
+    # Web Share API (`navigator.share` / `can_share` with files), used by ui/host.rs.
+    "ShareData",
+    "FilePropertyBag",
     "StorageManager",
     "Url",
     "Window",
