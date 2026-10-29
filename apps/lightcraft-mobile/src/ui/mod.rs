@@ -43,8 +43,8 @@ use lightcraft_pipeline::Quality;
 use crate::advisor::{Advice, Tip};
 use crate::analysis::Analysis;
 use crate::library::{
-    INDEX_KEY, KEEP_RECENT, Library, original_key, thumb_key, version_file_name, version_key,
-    version_thumb_key,
+    INDEX_BACKUP_KEY, INDEX_KEY, KEEP_RECENT, Library, export_file_name, original_key, thumb_key,
+    version_file_name, version_key, version_thumb_key,
 };
 use crate::looks::{LOOKS, look};
 use crate::photo::{JPEG_QUALITY, Photo, encode_jpeg, export_jpeg, export_size};
@@ -192,8 +192,13 @@ pub struct App {
     pending_thumbs: Vec<(String, Vec<u8>)>,
     pending_open: Option<PendingOpen>,
     pending_export_version: Option<u64>,
-    pick_pending: bool,
     armed_remove: Option<RemovalTarget>,
+    /// The stored index (and its backup) could not be read: index writes are
+    /// blocked until a good index loads, so a corrupt index is never saved
+    /// over. Cleared only by a successful index load.
+    index_write_blocked: bool,
+    /// A backup index load is in flight after a corrupt main index.
+    awaiting_index_backup: bool,
     /// The library index needs writing (a recipe changed); flushed at the end
     /// of a frame when no slider is being dragged, so a drag writes once.
     dirty_library: bool,
@@ -224,8 +229,9 @@ impl App {
             pending_thumbs: Vec::new(),
             pending_open: None,
             pending_export_version: None,
-            pick_pending: false,
             armed_remove: None,
+            index_write_blocked: false,
+            awaiting_index_backup: false,
             dirty_library: false,
         };
         app.host.send(HostRequest::Get { key: INDEX_KEY.to_string() });
@@ -280,8 +286,15 @@ impl App {
     }
 
     fn save_library(&mut self) {
+        // Blocked after a corrupt index load: never persist over a stored
+        // index that could not be read. The backup copy is written alongside
+        // every good index, so a corrupt main index can fall back to it.
+        if self.index_write_blocked {
+            return;
+        }
         let bytes = self.library.to_json().into_bytes();
-        self.host.send(HostRequest::Put { key: INDEX_KEY.to_string(), bytes });
+        self.host.send(HostRequest::Put { key: INDEX_KEY.to_string(), bytes: bytes.clone() });
+        self.host.send(HostRequest::Put { key: INDEX_BACKUP_KEY.to_string(), bytes });
     }
 
     fn handle_event(&mut self, event: HostEvent) {
@@ -290,7 +303,6 @@ impl App {
                 self.open_picked(name, bytes);
             }
             HostEvent::PickCancelled => {
-                self.pick_pending = false;
                 self.set_status("No photo picked.".to_string(), false);
             }
             HostEvent::Loaded { key, bytes } => {
@@ -306,25 +318,48 @@ impl App {
     }
 
     fn handle_loaded(&mut self, key: String, bytes: Option<Vec<u8>>) {
-        if key == INDEX_KEY {
-            let text = match bytes {
-                Some(b) => match String::from_utf8(b) {
-                    Ok(s) => s,
-                    Err(_) => String::new(),
-                },
-                None => String::new(),
-            };
-            // An empty or unreadable index is an empty library, never an error
-            // shown to the user: `Library::from_json` repairs garbage input.
-            self.library = Library::from_json(&text);
-            self.library_loaded = true;
-            for entry in self.library.recent() {
-                let k = thumb_key(entry.id);
-                self.host.send(HostRequest::Get { key: k });
+        if key == INDEX_BACKUP_KEY {
+            // Only a backup load requested after a corrupt main index counts;
+            // a stale or duplicate backup answer is ignored.
+            if !self.awaiting_index_backup {
+                return;
             }
-            for version in self.library.saved() {
-                let k = version_thumb_key(version.id);
-                self.host.send(HostRequest::Get { key: k });
+            self.awaiting_index_backup = false;
+            let good = match bytes {
+                Some(b) => String::from_utf8(b).ok().and_then(|t| Library::from_json_strict(&t).ok()),
+                None => None,
+            };
+            match good {
+                Some(lib) => {
+                    self.adopt_library(lib);
+                    self.index_write_blocked = false;
+                    self.set_status(
+                        "The saved library index could not be read, so the backup copy was used instead.".to_string(),
+                        false,
+                    );
+                }
+                None => self.finish_corrupt_index(),
+            }
+            return;
+        }
+        if key == INDEX_KEY {
+            match bytes {
+                None => {
+                    // First run: no stored index yet.
+                    self.library = Library::default();
+                    self.library_loaded = true;
+                }
+                Some(b) => match String::from_utf8(b) {
+                    Ok(text) => match Library::from_json_strict(&text) {
+                        Ok(lib) => self.adopt_library(lib),
+                        Err(e) => self.start_corrupt_index_recovery(&format!(
+                            "The saved library index could not be read ({e})."
+                        )),
+                    },
+                    Err(_) => self.start_corrupt_index_recovery(
+                        "The saved library index could not be read (it is not valid text).",
+                    ),
+                },
             }
             return;
         }
@@ -368,6 +403,45 @@ impl App {
         }
     }
 
+    /// Adopt a successfully parsed index and fetch its thumbnails.
+    fn adopt_library(&mut self, lib: Library) {
+        self.library = lib;
+        self.library_loaded = true;
+        for entry in self.library.recent() {
+            let k = thumb_key(entry.id);
+            self.host.send(HostRequest::Get { key: k });
+        }
+        for version in self.library.saved() {
+            let k = version_thumb_key(version.id);
+            self.host.send(HostRequest::Get { key: k });
+        }
+    }
+
+    /// A stored index could not be read: keep the in-memory library untouched
+    /// and try the backup copy. Index writes stay possible only if the backup
+    /// loads; if it does not, `finish_corrupt_index` blocks them.
+    fn start_corrupt_index_recovery(&mut self, message: &str) {
+        self.awaiting_index_backup = true;
+        self.set_status(
+            format!("{message} Trying the backup copy. Your stored photos are still there."),
+            true,
+        );
+        self.host.send(HostRequest::Get { key: INDEX_BACKUP_KEY.to_string() });
+    }
+
+    /// Neither the index nor its backup could be read: keep the in-memory
+    /// library, show the error, and block index writes so the unreadable
+    /// stored index is never overwritten with an empty one.
+    fn finish_corrupt_index(&mut self) {
+        self.awaiting_index_backup = false;
+        self.library_loaded = true;
+        self.index_write_blocked = true;
+        self.set_status(
+            "The saved library index and its backup could not be read. Your stored photos are still there, but edits will not be saved to the library index until a readable index loads.".to_string(),
+            true,
+        );
+    }
+
     fn open_loaded(&mut self, pending: PendingOpen, bytes: Option<Vec<u8>>) {
         let Some(bytes) = bytes else {
             self.set_status("That photo is no longer stored.".to_string(), true);
@@ -405,7 +479,6 @@ impl App {
     }
 
     fn open_picked(&mut self, name: String, bytes: Vec<u8>) {
-        self.pick_pending = false;
         let photo = match Photo::open(&bytes) {
             Ok(p) => p,
             Err(e) => {
@@ -651,7 +724,7 @@ impl App {
             return Err("No photo is open.".to_string());
         };
         let settings = self.current_settings();
-        export_jpeg(&current.bytes, &settings, JPEG_QUALITY).map_err(|e| format!("{e}"))
+        export_jpeg(&current.bytes, &settings, JPEG_QUALITY).map_err(|e| format!("Export failed: {e}"))
     }
 
     /// Save the current edit as a full resolution version kept by the app.
@@ -693,8 +766,11 @@ impl App {
             .map(|v| v.name.clone())
             .unwrap_or_else(|| version_file_name(&name, 1));
         self.save_library();
+        // The version bytes are still being written by the host: claim only
+        // that saving started. A failed write surfaces through the Failed
+        // event; there is no success event for a stored blob.
         self.set_status(
-            format!("Saved version {version_name} at {width} by {height}. Saved versions are kept."),
+            format!("Saving version {version_name} at {width} by {height}. Saved versions are kept."),
             false,
         );
     }
@@ -709,14 +785,16 @@ impl App {
                 return;
             }
         };
-        let (name, count) = match &self.current {
+        let (name, source_id, count, now) = match &self.current {
             Some(c) => (
                 c.name.clone(),
+                c.source_photo_id,
                 self.library.versions.iter().filter(|v| v.photo == c.source_photo_id).count() + 1,
+                self.host.now_ms(),
             ),
-            None => (String::new(), 1),
+            None => (String::new(), 0, 1, self.host.now_ms()),
         };
-        let file_name = version_file_name(&name, count);
+        let file_name = export_file_name(&name, source_id, count, now);
         self.host.send(HostRequest::SaveToDevice { name: file_name.clone(), bytes: jpeg });
         self.set_status(format!("Exporting {file_name}."), false);
     }
@@ -730,14 +808,16 @@ impl App {
                 return;
             }
         };
-        let (name, count) = match &self.current {
+        let (name, source_id, count, now) = match &self.current {
             Some(c) => (
                 c.name.clone(),
+                c.source_photo_id,
                 self.library.versions.iter().filter(|v| v.photo == c.source_photo_id).count() + 1,
+                self.host.now_ms(),
             ),
-            None => (String::new(), 1),
+            None => (String::new(), 0, 1, self.host.now_ms()),
         };
-        let file_name = version_file_name(&name, count);
+        let file_name = export_file_name(&name, source_id, count, now);
         self.host.send(HostRequest::Share { name: file_name, bytes: jpeg });
         self.set_status("Opening the share sheet.".to_string(), false);
     }
@@ -951,13 +1031,11 @@ impl App {
             )
             .clicked()
         {
-            if self.pick_pending {
-                self.set_status("The photo picker is already open.".to_string(), false);
-            } else {
-                self.pick_pending = true;
-                self.host.send(HostRequest::PickPhoto);
-                self.set_status("Choose a photo.".to_string(), false);
-            }
+            // No picker-open guard: cancelling the browser picker fires no
+            // event in most browsers, so a guard would deadlock Add photo
+            // until restart. Opening a second picker input is harmless.
+            self.host.send(HostRequest::PickPhoto);
+            self.set_status("Choose a photo.".to_string(), false);
         }
         ui.label(format!(
             "Keeping {} photos, {} stored. Saved versions are always kept. Unkept photos beyond the {} most recent are let go.",
@@ -2080,8 +2158,27 @@ mod tests {
         fresh.handle_event(HostEvent::Loaded { key: INDEX_KEY.to_string(), bytes: Some(index) });
         assert_eq!(fresh.library.photos.len(), 1);
         assert!(fresh.library.photos[0].kept);
-        // Garbage in the index is an empty library, not a crash.
+        // Garbage in the index keeps the library and tries the backup copy,
+        // instead of wiping the library and saving an empty index over it.
         fresh.handle_event(HostEvent::Loaded { key: INDEX_KEY.to_string(), bytes: Some(b"{{{".to_vec()) });
-        assert!(fresh.library.photos.is_empty());
+        assert_eq!(fresh.library.photos.len(), 1);
+        assert!(fresh.status_error);
+        assert!(fresh.awaiting_index_backup);
+        // The backup is missing too: the library is kept and index writes
+        // are blocked, so the corrupt stored index is never overwritten.
+        fresh.handle_event(HostEvent::Loaded { key: INDEX_BACKUP_KEY.to_string(), bytes: None });
+        assert_eq!(fresh.library.photos.len(), 1);
+        assert!(fresh.index_write_blocked);
+        let stored_before = state.borrow().store.get(INDEX_KEY).cloned();
+        fresh.save_library();
+        assert_eq!(state.borrow().store.get(INDEX_KEY).cloned(), stored_before);
+        // A readable backup recovers the library instead.
+        let mut fresh2 = App::new(Box::new(TestHost::new(Rc::clone(&state))));
+        fresh2.handle_event(HostEvent::Loaded { key: INDEX_KEY.to_string(), bytes: Some(b"{{{".to_vec()) });
+        let backup = state.borrow().store.get(INDEX_BACKUP_KEY).cloned();
+        fresh2.handle_event(HostEvent::Loaded { key: INDEX_BACKUP_KEY.to_string(), bytes: backup });
+        assert_eq!(fresh2.library.photos.len(), 1);
+        assert!(fresh2.library.photos[0].kept);
+        assert!(!fresh2.index_write_blocked);
     }
 }

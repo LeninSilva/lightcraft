@@ -1,9 +1,8 @@
 //! The platform boundary: everything the interface asks of the phone (pick a photo, store and
 //! load blobs, save a file where the user can find it, share) is a [`HostRequest`]; answers come
 //! back later as [`HostEvent`]s the app drains every frame. [`WebHost`] implements it with the
-//! browser (file picker, OPFS with an IndexedDB fallback, download export; see
-//! [`crate::ui::storage`]); sharing is not wired yet and answers [`HostEvent::Failed`]. Tests use
-//! [`MemoryHost`].
+//! browser (file picker, OPFS with an IndexedDB fallback, download export, Web Share
+//! with a download fallback; see [`crate::ui::storage`]). Tests use [`MemoryHost`].
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -101,6 +100,25 @@ impl Host for MemoryHost {
     }
 }
 
+/// Whether sharing a file needs the download fallback: the Web Share API is absent, or
+/// the browser says it cannot share files. Pure, so it is tested natively; the browser
+/// check itself lives in [`WebHost`]'s share flow.
+fn should_fallback_to_download(share_api_present: bool, can_share_files: bool) -> bool {
+    !share_api_present || !can_share_files
+}
+
+/// The message for a failed share, from the browser error's `name`. A cancelled share
+/// is the user's own choice and says so; any other failure names its kind, and an
+/// error with no name falls back to the supplied text. `Failed` events for sharing
+/// always carry one of these, never a bare "not available".
+fn share_failure_message(error_name: &str, fallback: &str) -> String {
+    match error_name {
+        "AbortError" => "Sharing was cancelled.".to_string(),
+        "" => fallback.to_string(),
+        name => format!("Sharing failed ({name})."),
+    }
+}
+
 /// A download name with no directory parts: the name the app asks to save, stripped of any
 /// `/` or `\` prefix, so a hostile or mistaken name cannot escape the download folder.
 /// Testable natively; used by [`WebHost`]'s download export.
@@ -111,11 +129,12 @@ fn safe_file_name(name: &str) -> &str {
 
 #[cfg(target_arch = "wasm32")]
 mod web_host {
-    use super::{Host, HostEvent, HostRequest, safe_file_name};
+    use super::{Host, HostEvent, HostRequest, safe_file_name, share_failure_message, should_fallback_to_download};
     use crate::ui::storage::Backend;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use js_sys::Reflect;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
@@ -142,14 +161,20 @@ mod web_host {
         }
     }
 
-    /// The browser host: the file picker, OPFS/IndexedDB storage, and download export.
-    /// Storage requests sent before the backend opens are queued and flushed in order once
-    /// it is ready; if it fails to open, every queued and later storage request answers
-    /// [`HostEvent::Failed`]. `Share` is not wired yet and always answers `Failed`.
+    /// The browser host: the file picker, OPFS/IndexedDB storage, download export, and
+    /// the Web Share API with a download fallback.
+    /// Storage requests are queued and run by one sequential worker, in queue
+    /// order, so a stale index write can never land after a newer one; requests
+    /// sent before the backend opens wait in the same queue. If the backend
+    /// fails to open, every queued and later storage request answers
+    /// [`HostEvent::Failed`]. `Share` opens the system share sheet when the browser
+    /// supports sharing files; otherwise it downloads the file instead and answers
+    /// [`HostEvent::Saved`], so the user still gets the file.
     pub struct WebHost {
         shared: Shared,
         backend: Rc<RefCell<BackendState>>,
         pending: Rc<RefCell<VecDeque<HostRequest>>>,
+        pumping: Rc<Cell<bool>>,
     }
 
     impl WebHost {
@@ -158,18 +183,14 @@ mod web_host {
             let shared = Shared { events: Rc::new(RefCell::new(VecDeque::new())), ctx };
             let backend: Rc<RefCell<BackendState>> = Rc::new(RefCell::new(BackendState::Opening));
             let pending: Rc<RefCell<VecDeque<HostRequest>>> = Rc::new(RefCell::new(VecDeque::new()));
-            let (b2, p2, s2) = (backend.clone(), pending.clone(), shared.clone());
+            let pumping: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            let (b2, p2, s2, pump2) = (backend.clone(), pending.clone(), shared.clone(), pumping.clone());
             wasm_bindgen_futures::spawn_local(async move {
                 match Backend::open().await {
                     Ok(b) => {
                         log::info!("lightcraft-mobile: storage backend {}", b.kind());
-                        *b2.borrow_mut() = BackendState::Ready(b.clone());
-                        for req in p2.borrow_mut().drain(..) {
-                            let (b3, s3) = (b.clone(), s2.clone());
-                            wasm_bindgen_futures::spawn_local(async move {
-                                run_storage(b3, req, s3).await;
-                            });
-                        }
+                        *b2.borrow_mut() = BackendState::Ready(b);
+                        kick_worker(&b2, &p2, &s2, &pump2);
                     }
                     Err(e) => {
                         log::warn!("lightcraft-mobile: storage unavailable: {e}");
@@ -181,21 +202,69 @@ mod web_host {
                     }
                 }
             });
-            WebHost { shared, backend, pending }
+            WebHost { shared, backend, pending, pumping }
         }
 
         fn storage(&mut self, request: HostRequest) {
-            match &*self.backend.borrow() {
-                BackendState::Ready(b) => {
-                    let (b, s) = (b.clone(), self.shared.clone());
-                    wasm_bindgen_futures::spawn_local(async move {
-                        run_storage(b, request, s).await;
-                    });
-                }
-                BackendState::Opening => self.pending.borrow_mut().push_back(request),
-                BackendState::Failed(message) => self.shared.push(HostEvent::Failed { what: "storage".into(), message: message.clone() }),
+            let failed = match &*self.backend.borrow() {
+                BackendState::Failed(message) => Some(message.clone()),
+                _ => None,
+            };
+            if let Some(message) = failed {
+                self.shared.push(HostEvent::Failed { what: "storage".into(), message });
+                return;
             }
+            self.pending.borrow_mut().push_back(request);
+            kick_worker(&self.backend, &self.pending, &self.shared, &self.pumping);
         }
+    }
+
+    /// Run queued storage requests one at a time, in queue order, awaiting each
+    /// before taking the next. Only one worker runs at a time (`pumping`
+    /// guards that); requests queued while it runs are picked up by its loop,
+    /// and a request queued after it stops restarts it through `kick_worker`.
+    async fn storage_worker(
+        backend: Backend,
+        pending: Rc<RefCell<VecDeque<HostRequest>>>,
+        shared: Shared,
+        pumping: Rc<Cell<bool>>,
+    ) {
+        loop {
+            let Some(req) = pending.borrow_mut().pop_front() else {
+                // Queue empty: stop, but re-check once after clearing the flag
+                // so a request queued in between is not stranded.
+                pumping.set(false);
+                if pending.borrow().is_empty() {
+                    return;
+                }
+                pumping.set(true);
+                continue;
+            };
+            run_storage(backend.clone(), req, shared.clone()).await;
+        }
+    }
+
+    /// Start the single storage worker if it is not already running and the
+    /// backend is ready. Requests queued while the backend is still opening
+    /// wait; the opener kicks the worker once the backend is ready.
+    fn kick_worker(
+        backend: &Rc<RefCell<BackendState>>,
+        pending: &Rc<RefCell<VecDeque<HostRequest>>>,
+        shared: &Shared,
+        pumping: &Rc<Cell<bool>>,
+    ) {
+        if pumping.get() {
+            return;
+        }
+        let ready = match &*backend.borrow() {
+            BackendState::Ready(b) => b.clone(),
+            _ => return,
+        };
+        pumping.set(true);
+        let (b, p, s, pump) = (ready, pending.clone(), shared.clone(), pumping.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            storage_worker(b, p, s, pump).await;
+        });
     }
 
     impl Host for WebHost {
@@ -214,10 +283,12 @@ mod web_host {
                         Err(message) => self.shared.push(HostEvent::Failed { what: "save".into(), message }),
                     }
                 }
-                HostRequest::Share { name, .. } => self.shared.push(HostEvent::Failed {
-                    what: "share".into(),
-                    message: format!("Sharing {name} is not available in this build yet; save the file first."),
-                }),
+                HostRequest::Share { name, bytes } => {
+                    let shared = self.shared.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        share_photo(shared, name, bytes).await;
+                    });
+                }
             }
         }
 
@@ -247,12 +318,109 @@ mod web_host {
         }
     }
 
+    /// The MIME type for a download or share, from the file name's extension.
+    fn mime_for(name: &str) -> &'static str {
+        let clean = safe_file_name(name);
+        if clean.ends_with(".jpg") || clean.ends_with(".jpeg") {
+            "image/jpeg"
+        } else if clean.ends_with(".png") {
+            "image/png"
+        } else {
+            "application/octet-stream"
+        }
+    }
+
+    /// The `name` property of a browser error, or empty when the error has none.
+    fn error_name(e: &JsValue) -> String {
+        Reflect::get(e, &"name".into()).ok().and_then(|n| n.as_string()).unwrap_or_default()
+    }
+
+    /// Download `bytes` and answer `Saved`, or answer `Failed` with the download error.
+    /// Used by `SaveToDevice` and as the share fallback.
+    fn download_and_answer(shared: &Shared, name: &str, bytes: &[u8]) {
+        let clean = safe_file_name(name).to_string();
+        match download(name, bytes) {
+            Ok(()) => shared.push(HostEvent::Saved { name: clean.clone(), location: format!("Downloads/{clean}") }),
+            Err(message) => shared.push(HostEvent::Failed { what: "save".into(), message }),
+        }
+    }
+
+    /// Share `bytes` with the system share sheet (Web Share API, files). When the browser
+    /// has no share API or cannot share files, the file is downloaded instead and the
+    /// answer is `Saved`, so the user still gets the file. A share the user cancels, or
+    /// one the browser rejects, answers `Failed` with the real reason.
+    async fn share_photo(shared: Shared, name: String, bytes: Vec<u8>) {
+        let Some(window) = web_sys::window() else {
+            download_and_answer(&shared, &name, &bytes);
+            return;
+        };
+        let navigator = window.navigator();
+        let navigator_value: JsValue = navigator.clone().into();
+        let share_fn = Reflect::get(&navigator_value, &"share".into()).ok();
+        let share_present = share_fn.as_ref().is_some_and(|f| f.is_function());
+        let can_share_fn = Reflect::get(&navigator_value, &"can_share".into()).ok();
+        let can_share_present = can_share_fn.as_ref().is_some_and(|f| f.is_function());
+        let clean = safe_file_name(&name).to_string();
+        let file = match make_share_file(&clean, &bytes) {
+            Ok(f) => f,
+            Err(message) => {
+                shared.push(HostEvent::Failed { what: "share".into(), message });
+                return;
+            }
+        };
+        let data = web_sys::ShareData::new();
+        data.set_files(&js_sys::Array::of1(&file));
+        let can_share = if can_share_present {
+            navigator.can_share(&data).unwrap_or(false)
+        } else {
+            false
+        };
+        if should_fallback_to_download(share_present, can_share) {
+            log::info!("lightcraft-mobile: Web Share unavailable for files; downloading instead");
+            download_and_answer(&shared, &name, &bytes);
+            return;
+        }
+        let promise = match navigator.share(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                let message = share_failure_message(&error_name(&e), "Sharing is not available in this browser.");
+                shared.push(HostEvent::Failed { what: "share".into(), message });
+                return;
+            }
+        };
+        match JsFuture::from(promise).await {
+            Ok(()) => shared.push(HostEvent::Saved { name: clean, location: "the share sheet".into() }),
+            Err(e) => {
+                let message = share_failure_message(&error_name(&e), "Sharing failed.");
+                shared.push(HostEvent::Failed { what: "share".into(), message });
+            }
+        }
+    }
+
+    /// A [`web_sys::File`] holding `bytes`, for the Web Share API.
+    fn make_share_file(name: &str, bytes: &[u8]) -> Result<web_sys::File, String> {
+        let arr = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+        let opts = web_sys::FilePropertyBag::new();
+        opts.set_type(mime_for(name));
+        web_sys::File::new_with_u8_array_sequence_and_options(&arr, name, &opts)
+            .map_err(|e| format!("could not prepare {name} for sharing: {e:?}"))
+    }
+
     /// Show the browser's open dialog; the picked file is read asynchronously and answers
     /// [`HostEvent::Picked`]. Cancelling the dialog fires no event in most browsers, so the
-    /// app simply waits (the same limitation as the desktop web app's picker).
+    /// app simply waits (the same limitation as the desktop web app's picker); the app no
+    /// longer blocks Add photo on a pending pick, so a cancelled pick costs one more tap.
+    /// Every failure path here answers `PickCancelled`, so the app is never left
+    /// waiting on a picker that cannot open.
     fn pick_photo(shared: Shared) {
-        let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
-        let Ok(input) = doc.create_element("input").map(|e| e.unchecked_into::<web_sys::HtmlInputElement>()) else { return };
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            shared.push(HostEvent::PickCancelled);
+            return;
+        };
+        let Ok(input) = doc.create_element("input").map(|e| e.unchecked_into::<web_sys::HtmlInputElement>()) else {
+            shared.push(HostEvent::PickCancelled);
+            return;
+        };
         input.set_type("file");
         input.set_multiple(false);
         input.set_accept("image/*,.jpg,.jpeg,.png,.webp,.tif,.tiff,.dng,.cr2,.cr3,.nef,.arw,.orf,.rw2,.raf,.pef,.heic,.heif,.avif");
@@ -274,6 +442,8 @@ mod web_host {
                         Err(e) => s2.push(HostEvent::Failed { what: "pick".into(), message: format!("reading {}: {e:?}", f.name()) }),
                     }
                 });
+            } else {
+                shared.push(HostEvent::PickCancelled);
             }
         });
         input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
@@ -289,14 +459,7 @@ mod web_host {
         let clean = safe_file_name(name);
         let arr = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
         let opts = web_sys::BlobPropertyBag::new();
-        let mime = if clean.ends_with(".jpg") || clean.ends_with(".jpeg") {
-            "image/jpeg"
-        } else if clean.ends_with(".png") {
-            "image/png"
-        } else {
-            "application/octet-stream"
-        };
-        opts.set_type(mime);
+        opts.set_type(mime_for(name));
         let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&arr, &opts).map_err(e)?;
         let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(e)?;
         let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
@@ -329,6 +492,21 @@ mod tests {
         assert_eq!(safe_file_name("C:\\Users\\x\\edited.jpg"), "edited.jpg");
         assert_eq!(safe_file_name(""), "photo");
         assert_eq!(safe_file_name("a/"), "photo");
+    }
+
+    #[test]
+    fn share_fallback_only_when_sharing_cannot_work() {
+        assert!(!should_fallback_to_download(true, true));
+        assert!(should_fallback_to_download(false, true));
+        assert!(should_fallback_to_download(true, false));
+        assert!(should_fallback_to_download(false, false));
+    }
+
+    #[test]
+    fn share_failures_carry_a_real_reason() {
+        assert_eq!(share_failure_message("AbortError", "Sharing failed."), "Sharing was cancelled.");
+        assert_eq!(share_failure_message("NotAllowedError", "Sharing failed."), "Sharing failed (NotAllowedError).");
+        assert_eq!(share_failure_message("", "Sharing is not available in this browser."), "Sharing is not available in this browser.");
     }
 
     #[test]

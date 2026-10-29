@@ -95,9 +95,33 @@ async fn idb_done(tx: &web_sys::IdbTransaction) -> Result<(), String> {
     JsFuture::from(p).await.map(|_| ()).map_err(err)
 }
 
+/// Ask the browser not to evict our storage under pressure, best effort: a missing
+/// storage manager, a rejected request, or a refusal all leave storage usable, they
+/// only leave it evictable. Mirrors the desktop web app's `request_persistence`.
+async fn request_persistence() {
+    let Some(sm) = storage_manager() else { return };
+    let already = match sm.persisted() {
+        Ok(p) => JsFuture::from(p).await.ok().is_some_and(|v| v.is_truthy()),
+        Err(_) => false,
+    };
+    if already {
+        return;
+    }
+    match sm.persist() {
+        Ok(p) => {
+            let granted = JsFuture::from(p).await.ok().is_some_and(|v| v.is_truthy());
+            log::info!("lightcraft-mobile: persistent storage {}", if granted { "granted" } else { "not granted" });
+        }
+        Err(_) => {}
+    }
+}
+
 impl Backend {
-    /// OPFS if writable from here, else IndexedDB.
+    /// OPFS if writable from here, else IndexedDB. Persistence is requested first, so
+    /// the library and saved versions are less likely to be evicted under storage
+    /// pressure; the request never fails opening.
     pub async fn open() -> Result<Backend, String> {
+        request_persistence().await;
         if opfs_writable()
             && let Some(sm) = storage_manager()
         {
