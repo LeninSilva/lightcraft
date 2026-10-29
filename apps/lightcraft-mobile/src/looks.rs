@@ -4,9 +4,10 @@
 //!
 //! A look returns full target settings built on `base`: [`crate::recipe::compose`] blends
 //! from the current settings to the look's, so a look mostly moves the sliders the recipe
-//! blend knows about (light, white balance, colour, effects, detail, curve, grading
-//! saturation/luminance, vignette and grain amounts). Fields outside that blend (grading
-//! hues, treatment) are set to the look's own values and take effect as the strength rises.
+//! blend knows about (light, white balance, colour, effects, detail, curve, grading,
+//! vignette and grain). Grading hues blend along the shortest arc with the strength,
+//! so a look at 10% strength does not yet carry the look's full hue shift; `treatment`
+//! is the one field that snaps, to the look's value once the strength reaches 50%.
 
 use lightcraft_develop::{DevelopSettings, Treatment, Wheel};
 use lightcraft_geom::Point;

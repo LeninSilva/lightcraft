@@ -22,6 +22,17 @@ fn set_status(text: &str) {
     }
 }
 
+/// Show a start failure where the user can see it: replace the loading
+/// overlay's text (the overlay is full-screen and visible) and mirror it
+/// into the aria-live status element. Without this, a failed start leaves
+/// "Loading LightCraft…" on screen forever.
+fn show_start_error(text: &str) {
+    if let Some(el) = window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("lightcraft_loading")) {
+        el.set_text_content(Some(text));
+    }
+    set_status(text);
+}
+
 /// The eframe app: the mobile [`App`] behind this egui fork's split `logic`/`ui` trait
 /// (mirroring `apps/lightcraft-web`'s `WebApp`).
 struct MobileApp {
@@ -48,6 +59,7 @@ pub fn start() {
             .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
         else {
             log::error!("missing <canvas id=\"lightcraft_canvas\">");
+            show_start_error("LightCraft Mobile failed to start: the page has no photo canvas.");
             return;
         };
         let runner = eframe::WebRunner::new();
@@ -69,7 +81,7 @@ pub fn start() {
             }
             Err(e) => {
                 log::error!("LightCraft Mobile failed to start: {e:?}");
-                set_status(&format!("LightCraft Mobile failed to start: {e:?}"));
+                show_start_error(&format!("LightCraft Mobile failed to start: {e:?}"));
             }
         }
     });

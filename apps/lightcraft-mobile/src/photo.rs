@@ -130,8 +130,12 @@ pub fn export_size(w: u32, h: u32, s: &DevelopSettings) -> (u32, u32) {
 }
 
 /// Render the original `bytes` at full resolution with `s` and encode a JPEG.
+/// A failed full-resolution decode is an error, never a silent fall back to
+/// the small proxy: the caller reports the failure instead of saving a
+/// low-resolution file the user believes is full resolution.
 pub fn export_jpeg(bytes: &[u8], s: &DevelopSettings, quality: u8) -> Result<Vec<u8>, PhotoError> {
-    let (full, w, h) = decode_oriented(bytes, None)?;
+    let (full, w, h) =
+        decode_oriented(bytes, None).map_err(|e| PhotoError(format!("the original could not be decoded: {e}")))?;
     let (ow, oh) = export_size(w, h, s);
     let req = RenderRequest::fit(ow as usize, oh as usize);
     let rendered = lightcraft_pipeline::render(&full, &SourceInfo::default(), s, &req);

@@ -227,7 +227,27 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     if v.is_finite() { v.clamp(lo, hi) } else { 0.0_f64.clamp(lo, hi) }
 }
 
+/// Blend two hues along the shortest arc of the colour circle, `t` of the way from `a`
+/// to `b`. A straight linear blend would sweep through unrelated hues (for example from
+/// 350 degrees to 10 degrees through 180); the shortest arc never moves further than
+/// the target hue. Non-finite inputs fall back to `b` sanitised into range.
+fn blend_hue(a: f64, b: f64, t: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return if b.is_finite() { b.rem_euclid(360.0) } else { 0.0 };
+    }
+    let delta = (b - a + 540.0).rem_euclid(360.0) - 180.0;
+    (a + delta * t).rem_euclid(360.0)
+}
+
 /// Linear blend of the numeric develop sliders a recipe can touch, `t` of the way from `a` to `b`.
+///
+/// Every field a look or the Auto enhancement sets is interpolated, so a look at
+/// strength 0 is the base settings and at strength 1 is the look's settings, with no
+/// field snapping early. Grading hues blend along the shortest arc (see
+/// [`blend_hue`]); `treatment` is the one exception, it snaps to `b` at `t >= 0.5`,
+/// because there is no halfway between colour and black and white. Fields no look
+/// or enhancement sets (mixer, calibration, optics, masks) are identical in `a` and
+/// `b` at every call site, so they come from `b` unchanged.
 pub fn blend(a: &DevelopSettings, b: &DevelopSettings, t: f64) -> DevelopSettings {
     let t = clamp(t, 0.0, 1.0);
     let l = |x: f64, y: f64| x + (y - x) * t;
@@ -260,10 +280,25 @@ pub fn blend(a: &DevelopSettings, b: &DevelopSettings, t: f64) -> DevelopSetting
         (&mut s.grading.highlights, (a.grading.highlights, b.grading.highlights)),
         (&mut s.grading.global, (a.grading.global, b.grading.global)),
     ] {
-        // hue stays the target's (blending hues through the circle would sweep colours)
+        w.hue = blend_hue(wa.hue, wb.hue, t);
         w.sat = l(wa.sat, wb.sat);
         w.lum = l(wa.lum, wb.lum);
     }
+    s.grading.blending = l(a.grading.blending, b.grading.blending);
+    s.grading.balance = l(a.grading.balance, b.grading.balance);
+    s.grain.size = l(a.grain.size, b.grain.size);
+    s.grain.roughness = l(a.grain.roughness, b.grain.roughness);
+    s.vignette.midpoint = l(a.vignette.midpoint, b.vignette.midpoint);
+    s.vignette.roundness = l(a.vignette.roundness, b.vignette.roundness);
+    s.vignette.feather = l(a.vignette.feather, b.vignette.feather);
+    s.vignette.highlights = l(a.vignette.highlights, b.vignette.highlights);
+    s.detail.sharpen_radius = l(a.detail.sharpen_radius, b.detail.sharpen_radius);
+    s.detail.sharpen_detail = l(a.detail.sharpen_detail, b.detail.sharpen_detail);
+    s.detail.sharpen_masking = l(a.detail.sharpen_masking, b.detail.sharpen_masking);
+    s.detail.nr_detail = l(a.detail.nr_detail, b.detail.nr_detail);
+    s.detail.nr_contrast = l(a.detail.nr_contrast, b.detail.nr_contrast);
+    s.detail.nr_color_detail = l(a.detail.nr_color_detail, b.detail.nr_color_detail);
+    s.detail.nr_color_smoothness = l(a.detail.nr_color_smoothness, b.detail.nr_color_smoothness);
     s.curve.master = blend_curve(&a.curve.master, &b.curve.master, t);
     if t < 0.5 {
         s.treatment = a.treatment;
@@ -338,7 +373,10 @@ fn apply_tune(s: &mut DevelopSettings, t: &Tune) {
             .map(|i| {
                 let x = f64::from(i) / 8.0;
                 let y = eval_curve(&base, x);
-                Point::new(x, lift + y * (1.0 - lift * 0.6))
+                // The lift pushes the white end above 1.0 without this clamp
+                // (`Point::new` does not clamp); a curve point above white is
+                // outside the tone curve's range.
+                Point::new(x, (lift + y * (1.0 - lift * 0.6)).clamp(0.0, 1.0))
             })
             .collect();
     }
@@ -369,7 +407,15 @@ fn apply_focus(s: &mut DevelopSettings, f: &Focus, a: &Analysis) {
         return;
     }
     let ((cx, cy), r) = focus_geometry(f, a);
-    let radial = |invert: bool| MaskShape::Radial { center: Point::new(cx, cy), rx: r, ry: r, angle: 0.0, feather: 70.0, invert };
+    // `r` is a fraction of the long edge, but radial radii are in normalized image
+    // coordinates (fractions of the width and height respectively). Converting both
+    // to the same pixel radius keeps the focus area round on non-square photos;
+    // using `r` for both would squash it along the short edge.
+    let (w, h) = (a.width.max(1) as f64, a.height.max(1) as f64);
+    let long = w.max(h);
+    let rx = clamp(r * long / w, 0.0, 1.0);
+    let ry = clamp(r * long / h, 0.0, 1.0);
+    let radial = |invert: bool| MaskShape::Radial { center: Point::new(cx, cy), rx, ry, angle: 0.0, feather: 70.0, invert };
     let subject = LocalAdjustments {
         exposure: 0.25 * amount,
         clarity: 25.0 * amount,
@@ -447,7 +493,12 @@ fn apply_frame(s: &mut DevelopSettings, fr: &Frame, a: &Analysis) {
     s.crop.geometry.rect = aspect_crop(fr.aspect.ratio(), w, h, around);
 }
 
-/// Turn a recipe into develop settings for this photo.
+/// Turn a recipe into develop settings for this photo, in one fixed order, used by
+/// the preview, the look thumbnails and the full-resolution export alike: Auto is
+/// blended in first, then the look (blended by its strength, over the Auto result),
+/// then the Tune sliders (which always win over Auto and the look), then Focus
+/// masks, then framing. A look's aim fields overwrite the Auto result at full
+/// strength; at partial strength the two are blended, never added.
 pub fn compose(r: &Recipe, a: &Analysis) -> DevelopSettings {
     let neutral = DevelopSettings::default();
     let mut s = if r.auto > 0.0 { blend(&neutral, &advisor::enhance(a), clamp(r.auto, 0.0, 100.0) / 100.0) } else { neutral };
@@ -459,7 +510,10 @@ pub fn compose(r: &Recipe, a: &Analysis) -> DevelopSettings {
     apply_focus(&mut s, &r.focus, a);
     apply_frame(&mut s, &r.frame, a);
     if s.treatment == Treatment::Bw {
+        // A Tune slider applied after the look must not resurrect colour: both
+        // saturation and vibrance stay at or below zero under black and white.
         s.color.saturation = s.color.saturation.min(0.0);
+        s.color.vibrance = s.color.vibrance.min(0.0);
     }
     s
 }
@@ -616,6 +670,97 @@ mod tests {
         assert!(!h.can_undo());
         let fwd = h.redo(&back2).unwrap();
         assert_eq!(fwd.tune.exposure, 1.0);
+    }
+
+    #[test]
+    fn blend_hue_takes_the_shortest_arc_and_follows_strength() {
+        assert_eq!(blend_hue(350.0, 10.0, 0.0), 350.0);
+        assert!((blend_hue(350.0, 10.0, 0.5) - 0.0).abs() < 1e-9);
+        assert_eq!(blend_hue(350.0, 10.0, 1.0), 10.0);
+        assert!((blend_hue(30.0, 350.0, 0.5) - 10.0).abs() < 1e-9);
+        assert_eq!(blend_hue(10.0, 350.0, 0.5), blend_hue(350.0, 10.0, 0.5));
+    }
+
+    #[test]
+    fn blend_grading_hues_and_blending_follow_strength() {
+        let base = DevelopSettings::default();
+        let mut styled = looks::apply("golden", &analysis(), &base);
+        styled.grading.blending = 80.0;
+        styled.grading.balance = 20.0;
+        let none = blend(&base, &styled, 0.0);
+        assert_eq!(none.grading.shadows.hue, base.grading.shadows.hue);
+        assert_eq!(none.grading.blending, base.grading.blending);
+        let half = blend(&base, &styled, 0.5);
+        assert!((half.grading.shadows.hue - 15.0).abs() < 1e-9, "{}", half.grading.shadows.hue);
+        assert!((half.grading.blending - (base.grading.blending + 80.0) / 2.0).abs() < 1e-9);
+        assert!((half.grading.balance - 10.0).abs() < 1e-9);
+        let full = blend(&base, &styled, 1.0);
+        assert_eq!(full.grading.shadows.hue, 30.0);
+        assert_eq!(full.grading.blending, 80.0);
+    }
+
+    #[test]
+    fn blend_interpolates_grain_size_and_vignette_shape() {
+        let mut a = DevelopSettings::default();
+        let mut b = DevelopSettings::default();
+        a.grain.size = 10.0;
+        b.grain.size = 90.0;
+        a.vignette.feather = 20.0;
+        b.vignette.feather = 80.0;
+        let half = blend(&a, &b, 0.5);
+        assert_eq!(half.grain.size, 50.0);
+        assert_eq!(half.vignette.feather, 50.0);
+        assert_eq!(blend(&a, &b, 0.0).grain.size, 10.0);
+    }
+
+    #[test]
+    fn focus_mask_is_round_in_pixels_on_a_wide_photo() {
+        let mut r = Recipe::default();
+        r.focus.amount = 80.0;
+        let s = compose(&r, &analysis());
+        let shape = &s.masks[0].components[0].shape;
+        let MaskShape::Radial { rx, ry, .. } = shape else {
+            panic!("focus mask is not radial: {shape:?}");
+        };
+        // Pixel radii: rx is a fraction of the width (300), ry of the height (200).
+        assert!((*rx * 300.0 - *ry * 200.0).abs() < 1e-9, "rx={rx} ry={ry}");
+    }
+
+    #[test]
+    fn fade_curve_stays_inside_the_tone_range() {
+        let mut r = Recipe::default();
+        r.tune.fade = 100.0;
+        let matte = Recipe { look: Some("matte".to_string()), look_strength: 100.0, tune: r.tune, ..Recipe::default() };
+        for recipe in [&r, &matte] {
+            let s = compose(recipe, &analysis());
+            for p in &s.curve.master {
+                assert!(p.y >= 0.0 && p.y <= 1.0, "fade point {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn black_and_white_look_plus_tune_stays_black_and_white() {
+        let mut r = Recipe::default();
+        r.look = Some("noir".to_string());
+        r.look_strength = 100.0;
+        r.tune.saturation = 50.0;
+        r.tune.vibrance = 50.0;
+        let s = compose(&r, &analysis());
+        assert_eq!(s.treatment, Treatment::Bw);
+        assert!(s.color.saturation <= 0.0 && s.color.vibrance <= 0.0);
+    }
+
+    #[test]
+    fn auto_look_and_tune_apply_in_order() {
+        let mut r = Recipe::default();
+        r.auto = 100.0;
+        r.look = Some("clear".to_string());
+        r.look_strength = 100.0;
+        let styled = looks::apply("clear", &analysis(), &DevelopSettings::default());
+        assert_eq!(compose(&r, &analysis()).light.exposure, styled.light.exposure);
+        r.tune.exposure = 1.0;
+        assert_eq!(compose(&r, &analysis()).light.exposure, styled.light.exposure + 1.0);
     }
 
     #[test]

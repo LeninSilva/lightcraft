@@ -16,6 +16,9 @@ use crate::recipe::Recipe;
 
 /// Storage key of the library index (JSON).
 pub const INDEX_KEY: &str = "library/index.json";
+/// Storage key of the last good index, kept so a corrupt index can fall back
+/// to it instead of wiping the library.
+pub const INDEX_BACKUP_KEY: &str = "library/index-backup.json";
 /// Un-kept photos kept around (most recently opened first).
 pub const KEEP_RECENT: usize = 12;
 /// Soft cap on stored originals plus versions (bytes).
@@ -108,12 +111,35 @@ pub fn version_file_name(photo_name: &str, n: usize) -> String {
     if n <= 1 { format!("{safe}_lightcraft.jpg") } else { format!("{safe}_lightcraft_{n}.jpg") }
 }
 
+/// File name for an export or share: the version name plus the photo id, the
+/// version number and the export time in milliseconds, so two exports of the
+/// same photo never share a name and overwrite each other in Downloads.
+pub fn export_file_name(photo_name: &str, photo_id: u64, n: usize, now_ms: f64) -> String {
+    let base = version_file_name(photo_name, 1);
+    let stem = base.strip_suffix(".jpg").unwrap_or(&base);
+    let millis = if now_ms.is_finite() && now_ms >= 0.0 { now_ms as u64 } else { 0 };
+    format!("{stem}_p{photo_id}_v{n}_{millis}.jpg")
+}
+
 impl Library {
     /// Parse a stored index; anything unreadable yields an empty library (never a panic).
     pub fn from_json(text: &str) -> Library {
         let mut lib: Library = serde_json::from_str(text).unwrap_or_default();
         lib.repair();
         lib
+    }
+
+    /// Parse a stored index strictly: an empty document is a first-run empty
+    /// library, but a non-empty document that does not parse is an error, so a
+    /// corrupt index is never silently treated as an empty library and saved
+    /// over the good one. Repair (dedup, `next_id`) still applies on success.
+    pub fn from_json_strict(text: &str) -> Result<Library, String> {
+        if text.trim().is_empty() {
+            return Ok(Library::default());
+        }
+        let mut lib: Library = serde_json::from_str(text).map_err(|e| format!("{e}"))?;
+        lib.repair();
+        Ok(lib)
     }
 
     pub fn to_json(&self) -> String {
@@ -227,7 +253,13 @@ impl Library {
     }
 
     /// Apply the retention policy, never letting go of `protect` (the photo open in the editor).
-    /// Returns the storage keys to delete.
+    /// Returns the storage keys to delete. Saved versions are deliberately NOT
+    /// deleted with their source photo: a version stays until the user deletes
+    /// it, even when the photo was let go. `stored_bytes` counts versions, so
+    /// the budget loop accounts for them; dropping a photo only frees its own
+    /// original and thumbnail bytes. Callers send the returned deletes before
+    /// saving the index, and the host runs storage requests in queue order,
+    /// so the index is never saved while it still names deleted blobs.
     pub fn prune(&mut self, protect: Option<u64>) -> Vec<String> {
         let mut drop_ids = Vec::new();
         let unkept: Vec<u64> = self.recent().into_iter().filter(|p| !p.kept && Some(p.id) != protect).map(|p| p.id).collect();
@@ -265,6 +297,29 @@ mod tests {
         assert_eq!(clean_name(&"é".repeat(500)).chars().count(), MAX_NAME);
         assert_eq!(version_file_name("IMG 1.jpeg", 1), "IMG_1_lightcraft.jpg");
         assert_eq!(version_file_name(".hidden", 2), "_hidden_lightcraft_2.jpg");
+    }
+
+    #[test]
+    fn strict_index_parse_rejects_garbage_but_accepts_empty() {
+        assert!(Library::from_json_strict("").photos.is_empty());
+        assert!(Library::from_json_strict("  \n").photos.is_empty());
+        assert!(Library::from_json_strict("{{{").is_err());
+        assert!(Library::from_json_strict("not json").is_err());
+        let lib = Library::from_json_strict(r#"{"next_id":0,"photos":[{"id":5},{"id":5}],"versions":[]}"#).unwrap();
+        assert_eq!(lib.photos.len(), 1);
+        assert!(lib.next_id >= 6);
+    }
+
+    #[test]
+    fn export_file_names_never_collide_for_different_photos_or_times() {
+        let a = export_file_name("IMG 1.jpeg", 1, 1, 1000.0);
+        let b = export_file_name("IMG 1.jpeg", 2, 1, 1000.0);
+        let c = export_file_name("IMG 1.jpeg", 1, 1, 1001.0);
+        let d = export_file_name("IMG 1.jpeg", 1, 2, 1000.0);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+        assert!(a.ends_with(".jpg"));
     }
 
     #[test]
