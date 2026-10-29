@@ -86,6 +86,22 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     let wasm = target_dir.join(TARGET).join(if dev { "debug" } else { profile }).join("lightcraft_mobile.wasm");
     let out = target_dir.join(SITE_DIR);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    // Clean the bundle outputs (and the wasm-opt temp file) before rebuilding,
+    // so files from an earlier build never survive into this bundle or the APK.
+    for name in [
+        "lightcraft_mobile.js",
+        "lightcraft_mobile_bg.wasm",
+        "lightcraft_mobile_bg.opt.wasm",
+        "index.html",
+        "lightcraft_mobile.js.gz",
+        "lightcraft_mobile.js.br",
+        "lightcraft_mobile_bg.wasm.gz",
+        "lightcraft_mobile_bg.wasm.br",
+        "index.html.gz",
+        "index.html.br",
+    ] {
+        let _ = std::fs::remove_file(out.join(name));
+    }
     let mut b = Command::new("wasm-bindgen");
     b.arg(&wasm).args(["--target", "web", "--no-typescript", "--out-name", "lightcraft_mobile", "--out-dir"]).arg(&out);
     if dev {
@@ -93,16 +109,28 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     }
     step(b, &format!("wasm-bindgen {} → {}", wasm.display(), out.display()))?;
 
-    // optional size pass when binaryen is installed
+    // optional size pass when binaryen is installed: optimize into a temp file
+    // and rename it over the bundle only on success, so a failed wasm-opt
+    // can never leave a corrupt module in place of the good one.
     let bg = out.join("lightcraft_mobile_bg.wasm");
     if !dev && Command::new("wasm-opt").arg("--version").output().is_ok() {
+        let tmp = out.join("lightcraft_mobile_bg.opt.wasm");
         let mut o = Command::new("wasm-opt");
         o.args(["-O2", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals"])
             .arg(&bg)
             .arg("-o")
-            .arg(&bg);
-        if step(o, "wasm-opt -O2").is_err() {
-            eprintln!("(wasm-opt failed; keeping the unoptimized module)");
+            .arg(&tmp);
+        match step(o, "wasm-opt -O2") {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &bg) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!("wasm-opt rename {}: {e}", tmp.display()));
+                }
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("(wasm-opt failed; keeping the unoptimized module)");
+            }
         }
     }
     for f in STATIC_FILES {
