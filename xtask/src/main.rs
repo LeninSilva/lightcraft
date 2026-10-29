@@ -13,6 +13,7 @@ mod layers;
 mod parity;
 mod stats;
 mod version;
+mod mobile;
 mod web;
 
 use std::path::{Path, PathBuf};
@@ -46,6 +47,8 @@ commands:
   web [--serve [port]] [--dev]
                   build the browser app (apps/lightcraft-web) into <target>/web-site/;
                   --serve serves it on http://127.0.0.1:<port> (default 8080)
+  mobile [--dev]  build the touch-first mobile app (apps/lightcraft-mobile) into
+                  <target>/mobile-site/ (the bundle the mobile APK workflow wraps)
   ci [--hardware] [--summary-md] [--quick [--base REF]]
                   fmt --check, clippy -D warnings, heif, test, GPU probe, parity refs, layers, assets, wasm
                   (stops at first failure). Tests run under cargo test (cargo nextest with
@@ -80,6 +83,7 @@ fn main() -> ExitCode {
         Some("parity") => parity::run(&root(), rest.contains(&"--write")),
         Some("wasm") => cmd_wasm(),
         Some("web") => web::run(&rest),
+        Some("mobile") => mobile::run(&rest),
         Some("ci") => cmd_ci(&rest),
         Some("corpus") => cmd_corpus(rest.contains(&"--download")),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
