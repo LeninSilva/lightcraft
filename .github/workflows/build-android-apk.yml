@@ -1,0 +1,84 @@
+name: Build Android APK
+
+# Fork-only APK build for LeninSilva/lightcraft (branch android-apk).
+# Builds the WebAssembly web app with `cargo xtask web`, then bundles the
+# static output offline in a Capacitor Android shell and uploads a debug APK.
+# This is NOT upstream LightCraft: upstream ships desktop + web only, and
+# the web build has no Android, SAM, or denoise support (see ANDROID-APK.md).
+# Debug APK: sideload only, not Play Store signed.
+
+on:
+  push:
+    branches: [android-apk]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust 1.95 + wasm target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The wasm build is the only Rust step; keep the cache keyed on it.
+          cache-targets: true
+
+      - name: Install wasm-bindgen-cli (exact version pinned by the repo)
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+
+      - name: Build the web app
+        run: cargo xtask web
+
+      - name: Check the web output
+        run: |
+          test -f target/web-site/index.html
+          test -f target/web-site/lightcraft_web_bg.wasm
+          ls -lh target/web-site/
+
+      - name: Set up Node 22 and Java 21
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Prepare Capacitor web assets
+        run: |
+          mkdir -p www resources
+          cp -r target/web-site/. www/
+          cp assets/app-icon/lightcraft-1024.png resources/icon.png
+          test -f www/lightcraft_web_bg.wasm
+
+      - name: Install Capacitor and create the Android shell
+        run: |
+          npm install @capacitor/core @capacitor/cli @capacitor/android @capacitor/assets
+          npx cap init 'LightCraft' ai.storyteller.lightcraft --web-dir=www
+          npx cap add android
+          npx capacitor-assets generate --android --iconBackgroundColor '#f2a516'
+          # Same Kotlin stdlib duplicate fix as the xiquilpan APK build.
+          printf '\nconfigurations.all { exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk7" }\nconfigurations.all { exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk8" }\n' >> android/app/build.gradle
+          npx cap sync
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lightcraft-android-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
