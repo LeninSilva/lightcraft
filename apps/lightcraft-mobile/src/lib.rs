@@ -20,3 +20,6 @@ pub mod looks;
 pub mod photo;
 pub mod recipe;
 pub mod ui;
+
+#[cfg(target_arch = "wasm32")]
+mod web;
