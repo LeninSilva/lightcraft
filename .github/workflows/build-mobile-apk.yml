@@ -54,6 +54,18 @@ jobs:
       - name: Install wasm-bindgen-cli (exact version pinned by the repo)
         run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
 
+      # wasm-opt is required, not optional: `cargo xtask mobile` silently
+      # keeps the unoptimized module when wasm-opt is absent or fails, so
+      # the build must fail here if the binary is missing. (The in-xtask
+      # failure swallow still stands; a one-line xtask change is needed
+      # to hard-fail on a wasm-opt error itself. Presence is enforced
+      # here, and the size assertion below catches gross bloat.)
+      - name: Install binaryen (wasm-opt) and require it
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          wasm-opt --version
+
       - name: Build the mobile app
         run: cargo xtask mobile
 
@@ -62,7 +74,14 @@ jobs:
           test -f target/mobile-site/index.html
           test -f target/mobile-site/lightcraft_mobile_bg.wasm
           test -f target/mobile-site/lightcraft_mobile.js
-          test "$(stat -c%s target/mobile-site/lightcraft_mobile_bg.wasm)" -gt 1000000
+          WASM_SIZE="$(stat -c%s target/mobile-site/lightcraft_mobile_bg.wasm)"
+          echo "wasm bytes: ${WASM_SIZE}"
+          test "${WASM_SIZE}" -gt 1000000
+          # No mobile wasm size has been recorded from a real build, so
+          # the upper bound is a generous sanity cap only (the desktop
+          # web wasm was about 13.5 MB); it catches catastrophic bloat,
+          # not a missed optimization pass.
+          test "${WASM_SIZE}" -lt 40000000
           ls -lh target/mobile-site/
 
       # Preserve the prebuilt static bundle for deployment (Vercel).
@@ -127,6 +146,12 @@ jobs:
           grep -q "versionCode ${GITHUB_RUN_NUMBER}" android/app/build.gradle
           grep -q "versionName \"${SHORT_SHA}\"" android/app/build.gradle
           grep -E 'versionCode|versionName' android/app/build.gradle
+
+      - name: Check FileProvider paths cover the share cache
+        run: |
+          test -f android/app/src/main/res/xml/file_paths.xml
+          grep -q 'cache-path' android/app/src/main/res/xml/file_paths.xml
+          cat android/app/src/main/res/xml/file_paths.xml
 
       - name: Build debug APK
         run: |
