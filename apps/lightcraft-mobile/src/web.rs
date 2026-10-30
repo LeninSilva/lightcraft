@@ -50,7 +50,7 @@ fn show_error_with_reload(el: &web_sys::Element, short: &str) {
             button.set_text_content(Some("Reload"));
             let _ = button.set_attribute(
                 "style",
-                "pointer-events:auto;font:inherit;padding:10px 18px;border-radius:8px;border:1px solid #666;background:#2a2a2a;color:#eee;",
+                "pointer-events:auto;font:inherit;padding:10px 18px;border-radius:10px;border:1px solid #3a3a3a;background:#262626;color:#eee;",
             );
             let on_click = Closure::<dyn FnMut()>::new(move || reload_page());
             let _ = button.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref());
@@ -295,8 +295,8 @@ fn show_debug_panel(text: &str) {
         button.set_text_content(Some("Dismiss debug"));
         let _ = button.set_attribute(
             "style",
-            "pointer-events:auto;margin-top:8px;padding:8px 14px;border-radius:8px;\
-            border:1px solid #666;background:#2a2a2a;color:#eee;font:inherit;",
+            "pointer-events:auto;margin-top:8px;padding:8px 14px;border-radius:10px;\
+            border:1px solid #3a3a3a;background:#262626;color:#eee;font:inherit;",
         );
         let panel_for_button = panel.clone();
         let on_click = Closure::<dyn FnMut()>::new(move || {
