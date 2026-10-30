@@ -28,6 +28,12 @@
       position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
       color: #b8b8b8; font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; pointer-events: none;
     }
+    /* An error shown in the loading overlay carries a real button: it
+       must receive pointer events even though the overlay itself does not. */
+    #lightcraft_loading button {
+      pointer-events: auto; font: inherit; padding: 10px 18px; border-radius: 8px;
+      border: 1px solid #666; background: #2a2a2a; color: #eee;
+    }
     #lightcraft_status { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; overflow: hidden; }
   </style>
 </head>
@@ -51,9 +57,19 @@
       await init({ module_or_path: module });
       start();
     })().catch((e) => {
+      // Detail stays in the console; the screen shows a short message
+      // and a Retry button that really reloads the page.
       console.error(e);
       const el = document.getElementById("lightcraft_loading");
-      if (el) el.textContent = "LightCraft failed to load: " + e;
+      if (!el) return;
+      el.textContent = "LightCraft failed to load.";
+      el.style.pointerEvents = "auto";
+      el.style.flexDirection = "column";
+      el.style.gap = "12px";
+      const btn = document.createElement("button");
+      btn.textContent = "Retry";
+      btn.addEventListener("click", () => location.reload());
+      el.appendChild(btn);
     });
   </script>
 </body>
