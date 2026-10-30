@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use lightcraft_develop::{DevelopSettings, LocalAdjustments, Mask, MaskComponent, MaskShape, Treatment, WbMode};
-use lightcraft_geom::{Orientation, Point, Rect};
+use lightcraft_geom::{CropGeometry, Orientation, Point, Rect, max_inscribed_scale};
 
 use crate::analysis::Analysis;
 use crate::{advisor, looks};
@@ -405,6 +405,20 @@ fn apply_tune(s: &mut DevelopSettings, t: &Tune) {
     s.detail.nr_color = clamp(s.detail.nr_color + nr * 0.5, 0.0, 100.0);
 }
 
+/// Move a point from the analysis frame (the EXIF-oriented image the subject
+/// was detected in) into the turned/flipped frame the crop rectangle and the
+/// mask shapes live in: the flip first, then the clockwise quarter turns, the
+/// same mapping [`Frame::sample`] applies to the image itself.
+fn into_turned_frame(p: (f64, f64), flip_h: bool, turns: u8) -> (f64, f64) {
+    let (x, y) = if flip_h { (1.0 - p.0, p.1) } else { p };
+    match turns % 4 {
+        1 => (1.0 - y, x),
+        2 => (1.0 - x, 1.0 - y),
+        3 => (y, 1.0 - x),
+        _ => (x, y),
+    }
+}
+
 /// The focus centre and radius a recipe uses on a photo.
 pub fn focus_geometry(f: &Focus, a: &Analysis) -> ((f64, f64), f64) {
     let c = f.center.unwrap_or((a.subject.cx, a.subject.cy));
@@ -415,21 +429,21 @@ pub fn focus_geometry(f: &Focus, a: &Analysis) -> ((f64, f64), f64) {
     (c, clamp(r, 0.05, 0.9))
 }
 
-fn apply_focus(s: &mut DevelopSettings, f: &Focus, a: &Analysis) {
+fn apply_focus(s: &mut DevelopSettings, f: &Focus, a: &Analysis, fr: &Frame) {
     let amount = clamp(f.amount, 0.0, 100.0) / 100.0;
     if amount <= 0.0 {
         return;
     }
     let ((cx, cy), r) = focus_geometry(f, a);
-    // `r` is a fraction of the long edge, but radial radii are in normalized image
-    // coordinates (fractions of the width and height respectively). Converting both
-    // to the same pixel radius keeps the focus area round on non-square photos;
-    // using `r` for both would squash it along the short edge.
-    let (w, h) = (a.width.max(1) as f64, a.height.max(1) as f64);
-    let long = w.max(h);
-    let rx = clamp(r * long / w, 0.0, 1.0);
-    let ry = clamp(r * long / h, 0.0, 1.0);
-    let radial = |invert: bool| MaskShape::Radial { center: Point::new(cx, cy), rx, ry, angle: 0.0, feather: 70.0, invert };
+    // The centre arrives in the analysis frame; masks are sampled in the
+    // turned/flipped frame, so it moves with the framing like the crop's
+    // subject point does.
+    let (cx, cy) = into_turned_frame((cx, cy), fr.flip_h, fr.turns);
+    // `r` is a fraction of the long edge, and radial radii are normalized to
+    // the long edge too (see `MaskShape::Radial`): equal radii are already a
+    // circle in pixels on any aspect, so no width/height conversion.
+    let r = clamp(r, 0.0, 1.0);
+    let radial = |invert: bool| MaskShape::Radial { center: Point::new(cx, cy), rx: r, ry: r, angle: 0.0, feather: 70.0, invert };
     let subject = LocalAdjustments {
         exposure: 0.25 * amount,
         clarity: 25.0 * amount,
@@ -487,24 +501,35 @@ pub fn aspect_crop(aspect: Option<f64>, frame_w: f64, frame_h: f64, around: Opti
 
 fn apply_frame(s: &mut DevelopSettings, fr: &Frame, a: &Analysis) {
     s.orientation = Orientation::from_parts(fr.flip_h, fr.turns % 4);
-    s.crop.geometry.angle = clamp(fr.straighten, -45.0, 45.0);
+    let angle = clamp(fr.straighten, -45.0, 45.0);
     // the crop rect lives in the oriented frame (after the quarter turns)
     let (mut w, mut h) = (a.width as f64, a.height as f64);
     let mut around = fr.smart.then_some((a.subject.cx, a.subject.cy));
     if fr.turns % 2 == 1 {
         std::mem::swap(&mut w, &mut h);
     }
-    if let Some((x, y)) = around {
+    if let Some(p) = around {
         // move the subject into the turned/flipped frame
-        let (x, y) = if fr.flip_h { (1.0 - x, y) } else { (x, y) };
-        around = Some(match fr.turns % 4 {
-            1 => (1.0 - y, x),
-            2 => (1.0 - x, 1.0 - y),
-            3 => (y, 1.0 - x),
-            _ => (x, y),
-        });
+        around = Some(into_turned_frame(p, fr.flip_h, fr.turns));
     }
-    s.crop.geometry.rect = aspect_crop(fr.aspect.ratio(), w, h, around);
+    let rect = aspect_crop(fr.aspect.ratio(), w, h, around);
+    let mut geometry = CropGeometry { rect, angle };
+    if angle != 0.0 && w > 0.0 && h > 0.0 {
+        // A straightened crop must stay inside the rotated image, or the
+        // sampler smears edge pixels into the corners. Shrink it about its
+        // own centre, keeping its aspect, to the largest size that fits at
+        // this angle; an off-centre crop the centred scale does not cover
+        // falls back to the engine's own angle handling.
+        let px = rect.scale(w, h);
+        let scale = max_inscribed_scale(w, h, angle, px.width(), px.height()).min(1.0);
+        if scale.is_finite() && scale < 1.0 {
+            geometry.rect = Rect::from_center(px.center(), px.width() * scale, px.height() * scale).scale(1.0 / w, 1.0 / h);
+        }
+        if !geometry.is_within_image(w, h) {
+            geometry = geometry.with_angle(angle, w, h);
+        }
+    }
+    s.crop.geometry = geometry;
 }
 
 /// Turn a recipe into develop settings for this photo, in one fixed order, used by
@@ -521,7 +546,7 @@ pub fn compose(r: &Recipe, a: &Analysis) -> DevelopSettings {
         s = blend(&s, &styled, clamp(r.look_strength, 0.0, 100.0) / 100.0);
     }
     apply_tune(&mut s, &r.tune);
-    apply_focus(&mut s, &r.focus, a);
+    apply_focus(&mut s, &r.focus, a, &r.frame);
     apply_frame(&mut s, &r.frame, a);
     if s.treatment == Treatment::Bw {
         // A Tune slider applied after the look must not resurrect colour: both
@@ -791,8 +816,45 @@ mod tests {
         let MaskShape::Radial { rx, ry, .. } = shape else {
             panic!("focus mask is not radial: {shape:?}");
         };
-        // Pixel radii: rx is a fraction of the width (300), ry of the height (200).
-        assert!((*rx * 300.0 - *ry * 200.0).abs() < 1e-9, "rx={rx} ry={ry}");
+        // Radial radii are normalized to the long edge, so equal radii are
+        // already a circle in pixels on a 300x200 photo.
+        assert_eq!(*rx, *ry, "rx={rx} ry={ry}");
+        assert!((*rx - 0.3125).abs() < 1e-9, "rx={rx}");
+    }
+
+    #[test]
+    fn focus_centre_moves_with_turns_and_flips() {
+        use crate::analysis::Subject;
+        let a = Analysis {
+            width: 300,
+            height: 200,
+            subject: Subject { cx: 0.8, cy: 0.3, ..Subject::default() },
+            ..Analysis::default()
+        };
+        let mut r = Recipe::default();
+        r.focus.amount = 80.0;
+        r.frame.turns = 1;
+        r.frame.flip_h = true;
+        let s = compose(&r, &a);
+        let shape = &s.masks[0].components[0].shape;
+        let MaskShape::Radial { center, .. } = shape else {
+            panic!("focus mask is not radial: {shape:?}");
+        };
+        // Flip first: (0.8, 0.3) -> (0.2, 0.3); one clockwise turn: -> (0.7, 0.2).
+        assert!((center.x - 0.7).abs() < 1e-9 && (center.y - 0.2).abs() < 1e-9, "centre={center:?}");
+    }
+
+    #[test]
+    fn straightened_crop_stays_inside_the_rotated_image() {
+        let mut r = Recipe::default();
+        r.frame.straighten = 30.0;
+        let s = compose(&r, &analysis());
+        let geometry = s.crop.geometry;
+        assert!(geometry.is_within_image(300.0, 200.0), "rect={:?}", geometry.rect);
+        assert!(geometry.rect.width() < 1.0 && geometry.rect.height() < 1.0);
+        // No straighten: the full frame is untouched.
+        let plain = compose(&Recipe::default(), &analysis());
+        assert_eq!(plain.crop.geometry.rect, Rect::UNIT);
     }
 
     #[test]

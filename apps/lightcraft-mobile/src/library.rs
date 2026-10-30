@@ -55,13 +55,17 @@ pub struct Entry {
     pub height: u32,
     /// Size of the stored original.
     pub bytes: u64,
+    /// Size of the stored thumbnail (counted in [`Library::stored_bytes`]).
+    /// Recorded by the UI when the thumbnail blob is written; 0 for indexes
+    /// written before thumbnails were counted.
+    pub thumb_bytes: u64,
     /// The current edit.
     pub recipe: Recipe,
 }
 
 impl Default for Entry {
     fn default() -> Self {
-        Entry { id: 0, name: String::new(), added_ms: 0.0, opened_ms: 0.0, kept: false, width: 0, height: 0, bytes: 0, recipe: Recipe::default() }
+        Entry { id: 0, name: String::new(), added_ms: 0.0, opened_ms: 0.0, kept: false, width: 0, height: 0, bytes: 0, thumb_bytes: 0, recipe: Recipe::default() }
     }
 }
 
@@ -77,19 +81,32 @@ pub struct Version {
     pub width: u32,
     pub height: u32,
     pub bytes: u64,
+    /// Size of the stored thumbnail (counted in [`Library::stored_bytes`]).
+    /// Recorded by the UI when the thumbnail blob is written; 0 for indexes
+    /// written before thumbnails were counted.
+    pub thumb_bytes: u64,
     /// The recipe it was rendered with (so it can be reopened for further edits while the
     /// original is still kept).
     pub recipe: Recipe,
 }
 
 /// The library index.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Library {
     pub version: u32,
     pub next_id: u64,
     pub photos: Vec<Entry>,
     pub versions: Vec<Version>,
+}
+
+impl Default for Library {
+    fn default() -> Self {
+        // A fresh library must already be a valid stored index: the strict
+        // parser requires version 1 and next_id >= 1, so a default library
+        // saved before any load must round-trip through it.
+        Self { version: VERSION, next_id: 1, photos: Vec::new(), versions: Vec::new() }
+    }
 }
 
 /// A display name from a file name: no directories, no control characters, bounded length.
@@ -121,6 +138,54 @@ pub fn export_file_name(photo_name: &str, photo_id: u64, n: usize, now_ms: f64) 
     format!("{stem}_p{photo_id}_v{n}_{millis}.jpg")
 }
 
+/// The stored index as written to disk, parsed strictly: every field the app
+/// itself writes is required, with no `#[serde(default)]` to paper over a
+/// truncated or hand-edited document. Two deliberate exceptions, both for
+/// indexes written before they existed: `thumb_bytes` (0 when absent) and the
+/// sub-fields of `recipe` (which carries its own defaults). The lenient
+/// [`Library`] shape with defaults is kept for the in-memory/test path
+/// ([`Library::from_json`]) and for [`Library::repair`].
+#[derive(Deserialize)]
+struct WireEntry {
+    id: u64,
+    name: String,
+    added_ms: f64,
+    opened_ms: f64,
+    kept: bool,
+    width: u32,
+    height: u32,
+    bytes: u64,
+    #[serde(default)]
+    thumb_bytes: u64,
+    #[serde(default)]
+    recipe: Recipe,
+}
+
+/// See [`WireEntry`].
+#[derive(Deserialize)]
+struct WireVersion {
+    id: u64,
+    photo: u64,
+    name: String,
+    created_ms: f64,
+    width: u32,
+    height: u32,
+    bytes: u64,
+    #[serde(default)]
+    thumb_bytes: u64,
+    #[serde(default)]
+    recipe: Recipe,
+}
+
+/// See [`WireEntry`].
+#[derive(Deserialize)]
+struct WireLibrary {
+    version: u32,
+    next_id: u64,
+    photos: Vec<WireEntry>,
+    versions: Vec<WireVersion>,
+}
+
 impl Library {
     /// Parse a stored index; anything unreadable yields an empty library (never a panic).
     pub fn from_json(text: &str) -> Library {
@@ -129,15 +194,60 @@ impl Library {
         lib
     }
 
-    /// Parse a stored index strictly: an empty document is a first-run empty
-    /// library, but a non-empty document that does not parse is an error, so a
-    /// corrupt index is never silently treated as an empty library and saved
-    /// over the good one. Repair (dedup, `next_id`) still applies on success.
+    /// Parse a stored index strictly: an empty or whitespace document is an
+    /// error, never a first-run empty library (`to_json` never produces an
+    /// empty document, so one can only be a truncated write), and a document
+    /// that parses but is wrong (unsupported version, `next_id` 0, a zero or
+    /// duplicate id, a missing name) is an error too, so the backup path runs
+    /// instead of the corrupt index being adopted and saved over the good
+    /// one. An absent file is not a document: callers treat "no bytes stored"
+    /// as first run before calling this. Repair (dedup, `next_id`) still
+    /// applies on success, as a belt over the pre-repair checks above.
     pub fn from_json_strict(text: &str) -> Result<Library, String> {
         if text.trim().is_empty() {
-            return Ok(Library::default());
+            return Err("empty index document".to_string());
         }
-        let mut lib: Library = serde_json::from_str(text).map_err(|e| format!("{e}"))?;
+        let wire: WireLibrary = serde_json::from_str(text).map_err(|e| format!("{e}"))?;
+        if wire.version != VERSION {
+            return Err(format!("unsupported index version {}", wire.version));
+        }
+        if wire.next_id < 1 {
+            return Err("index next_id is 0".to_string());
+        }
+        // Ids are checked before repair: repair dedups silently, which would
+        // hide a document that lost entries to truncation or editing.
+        let mut seen = std::collections::HashSet::new();
+        for p in &wire.photos {
+            if p.id == 0 {
+                return Err("index photo id is 0".to_string());
+            }
+            if !seen.insert(p.id) {
+                return Err(format!("duplicate index photo id {}", p.id));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for v in &wire.versions {
+            if v.id == 0 {
+                return Err("index version id is 0".to_string());
+            }
+            if !seen.insert(v.id) {
+                return Err(format!("duplicate index version id {}", v.id));
+            }
+        }
+        let mut lib = Library {
+            version: wire.version,
+            next_id: wire.next_id,
+            photos: wire
+                .photos
+                .into_iter()
+                .map(|w| Entry { id: w.id, name: w.name, added_ms: w.added_ms, opened_ms: w.opened_ms, kept: w.kept, width: w.width, height: w.height, bytes: w.bytes, thumb_bytes: w.thumb_bytes, recipe: w.recipe })
+                .collect(),
+            versions: wire
+                .versions
+                .into_iter()
+                .map(|w| Version { id: w.id, photo: w.photo, name: w.name, created_ms: w.created_ms, width: w.width, height: w.height, bytes: w.bytes, thumb_bytes: w.thumb_bytes, recipe: w.recipe })
+                .collect(),
+        };
         lib.repair();
         Ok(lib)
     }
@@ -157,6 +267,9 @@ impl Library {
         self.next_id = self.next_id.max(max.saturating_add(1)).max(1);
         for p in &mut self.photos {
             p.name = clean_name(&p.name);
+        }
+        for v in &mut self.versions {
+            v.name = clean_name(&v.name);
         }
     }
 
@@ -217,7 +330,7 @@ impl Library {
         let base = self.photo(photo).map(|p| p.name.clone()).unwrap_or_else(|| "Photo".into());
         let n = self.versions.iter().filter(|v| v.photo == photo).count() + 1;
         let name = version_file_name(&base, n);
-        self.versions.push(Version { id, photo, name, created_ms: now_ms, width, height, bytes, recipe: recipe.clone() });
+        self.versions.push(Version { id, photo, name, created_ms: now_ms, width, height, bytes, thumb_bytes: 0, recipe: recipe.clone() });
         id
     }
 
@@ -247,9 +360,30 @@ impl Library {
         v
     }
 
-    /// Bytes of stored originals and versions.
+    /// Record the size of a photo's stored thumbnail, for the storage budget.
+    /// Called by the UI after the thumbnail blob is written; nothing in this
+    /// module writes blobs.
+    pub fn set_thumb_bytes(&mut self, id: u64, bytes: u64) {
+        if let Some(p) = self.photo_mut(id) {
+            p.thumb_bytes = bytes;
+        }
+    }
+
+    /// Record the size of a saved version's stored thumbnail; see [`Library::set_thumb_bytes`].
+    pub fn set_version_thumb_bytes(&mut self, id: u64, bytes: u64) {
+        if let Some(v) = self.versions.iter_mut().find(|v| v.id == id) {
+            v.thumb_bytes = bytes;
+        }
+    }
+
+    /// Bytes of stored originals, versions, and their thumbnails. The two
+    /// index documents themselves are small and not counted.
     pub fn stored_bytes(&self) -> u64 {
-        self.photos.iter().map(|p| p.bytes).chain(self.versions.iter().map(|v| v.bytes)).fold(0u64, u64::saturating_add)
+        self.photos
+            .iter()
+            .map(|p| p.bytes.saturating_add(p.thumb_bytes))
+            .chain(self.versions.iter().map(|v| v.bytes.saturating_add(v.thumb_bytes)))
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Apply the retention policy, never letting go of `protect` (the photo open in the editor).
@@ -269,7 +403,7 @@ impl Library {
         let mut total = self.stored_bytes();
         for p in &self.photos {
             if drop_ids.contains(&p.id) {
-                total = total.saturating_sub(p.bytes);
+                total = total.saturating_sub(p.bytes.saturating_add(p.thumb_bytes));
             }
         }
         for id in unkept.iter().rev() {
@@ -278,7 +412,7 @@ impl Library {
             }
             if !drop_ids.contains(id) {
                 drop_ids.push(*id);
-                total = total.saturating_sub(self.photo(*id).map_or(0, |p| p.bytes));
+                total = total.saturating_sub(self.photo(*id).map_or(0, |p| p.bytes.saturating_add(p.thumb_bytes)));
             }
         }
         drop_ids.into_iter().flat_map(|id| self.remove_photo(id)).collect()
@@ -300,14 +434,55 @@ mod tests {
     }
 
     #[test]
-    fn strict_index_parse_rejects_garbage_but_accepts_empty() {
-        assert!(Library::from_json_strict("").unwrap().photos.is_empty());
-        assert!(Library::from_json_strict("  \n").unwrap().photos.is_empty());
+    fn strict_index_parse_rejects_empty_and_wrong_indexes() {
+        assert!(Library::from_json_strict("").is_err());
+        assert!(Library::from_json_strict("  \n").is_err());
         assert!(Library::from_json_strict("{{{").is_err());
         assert!(Library::from_json_strict("not json").is_err());
-        let lib = Library::from_json_strict(r#"{"next_id":0,"photos":[{"id":5},{"id":5}],"versions":[]}"#).unwrap();
+        // Unsupported version.
+        assert!(Library::from_json_strict(r#"{"version":2,"next_id":1,"photos":[],"versions":[]}"#).is_err());
+        // next_id 0.
+        assert!(Library::from_json_strict(r#"{"version":1,"next_id":0,"photos":[],"versions":[]}"#).is_err());
+        // Zero id.
+        assert!(Library::from_json_strict(r#"{"version":1,"next_id":1,"photos":[{"id":0,"name":"a.jpg","added_ms":0,"opened_ms":0,"kept":false,"width":1,"height":1,"bytes":1,"recipe":{}}],"versions":[]}"#).is_err());
+        // Duplicate ids, which repair would otherwise hide.
+        assert!(Library::from_json_strict(r#"{"version":1,"next_id":6,"photos":[{"id":5,"name":"a.jpg","added_ms":0,"opened_ms":0,"kept":false,"width":1,"height":1,"bytes":1,"recipe":{}},{"id":5,"name":"b.jpg","added_ms":0,"opened_ms":0,"kept":false,"width":1,"height":1,"bytes":1,"recipe":{}}],"versions":[]}"#).is_err());
+        // Missing name.
+        assert!(Library::from_json_strict(r#"{"version":1,"next_id":6,"photos":[{"id":5,"added_ms":0,"opened_ms":0,"kept":false,"width":1,"height":1,"bytes":1,"recipe":{}}],"versions":[]}"#).is_err());
+        // A well-formed index parses, with repair raising next_id past every id.
+        let lib = Library::from_json_strict(r#"{"version":1,"next_id":2,"photos":[{"id":5,"name":"a.jpg","added_ms":0,"opened_ms":0,"kept":false,"width":1,"height":1,"bytes":1,"recipe":{}}],"versions":[]}"#).unwrap();
         assert_eq!(lib.photos.len(), 1);
         assert!(lib.next_id >= 6);
+    }
+
+    #[test]
+    fn strict_index_parse_accepts_indexes_written_before_thumb_bytes() {
+        // Indexes written before thumbnails were counted have no thumb_bytes;
+        // they must still parse, with thumbnails counted as 0.
+        let lib = Library::from_json_strict(r#"{"version":1,"next_id":2,"photos":[{"id":1,"name":"a.jpg","added_ms":0,"opened_ms":0,"kept":false,"width":1,"height":1,"bytes":10,"recipe":{}}],"versions":[]}"#).unwrap();
+        assert_eq!(lib.photos[0].thumb_bytes, 0);
+        assert_eq!(lib.stored_bytes(), 10);
+    }
+
+    #[test]
+    fn stored_bytes_counts_thumbnails() {
+        let mut lib = Library::default();
+        let id = lib.add_photo("a.jpg", 10, 20, 100, 1.0);
+        let v = lib.add_version(id, 10, 20, 50, &Recipe::default(), 2.0);
+        assert_eq!(lib.stored_bytes(), 150);
+        lib.set_thumb_bytes(id, 30);
+        lib.set_version_thumb_bytes(v, 20);
+        assert_eq!(lib.stored_bytes(), 200);
+        // Unknown ids are ignored, never a panic.
+        lib.set_thumb_bytes(999, 10);
+        lib.set_version_thumb_bytes(999, 10);
+        assert_eq!(lib.stored_bytes(), 200);
+    }
+
+    #[test]
+    fn repair_sanitizes_version_names_like_photo_names() {
+        let lib = Library::from_json(r#"{"next_id":0,"photos":[],"versions":[{"id":9,"photo":0,"name":"a/b\u0000c.jpg","created_ms":0,"width":1,"height":1,"bytes":1}]}"#);
+        assert_eq!(lib.versions[0].name, "bc.jpg");
     }
 
     #[test]

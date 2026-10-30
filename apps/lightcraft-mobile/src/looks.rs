@@ -125,8 +125,9 @@ fn set_grading(s: &mut DevelopSettings, shadows: Wheel, midtones: Wheel, highlig
     s.grading.midtones = midtones;
     s.grading.highlights = highlights;
     s.grading.global = global;
-    s.grading.blending = 50.0;
-    s.grading.balance = 0.0;
+    // Blending and balance are the base's: a look sets hues, it does not
+    // reset the caller's grading balance (the engine default is 50/0, and
+    // `blend` interpolates these fields from the base at partial strength).
 }
 
 fn set_curve(s: &mut DevelopSettings, highlights: f64, lights: f64, darks: f64, shadows: f64) {
@@ -134,7 +135,36 @@ fn set_curve(s: &mut DevelopSettings, highlights: f64, lights: f64, darks: f64, 
     s.curve.lights = lights;
     s.curve.darks = darks;
     s.curve.shadows = shadows;
-    s.curve.master = Vec::new();
+    // The point curve is left alone: clearing it here would silently drop a
+    // caller's master curve on every look. Matte writes its own master curve
+    // explicitly, after calling this.
+}
+
+/// A look's vignette and grain, shape included: `blend` interpolates the
+/// size, roughness and vignette shape fields from the base, so leaving them
+/// unset would make every look share the base's grain and vignette shape.
+/// Looks without a character reason for a field pass the engine default
+/// (grain 25/50, vignette midpoint 50, roundness 0, feather 50, highlights 0).
+#[allow(clippy::too_many_arguments)]
+fn set_finish(
+    s: &mut DevelopSettings,
+    vignette_amount: f64,
+    grain_amount: f64,
+    grain_size: f64,
+    grain_roughness: f64,
+    midpoint: f64,
+    roundness: f64,
+    feather: f64,
+    highlights: f64,
+) {
+    s.vignette.amount = vignette_amount;
+    s.vignette.midpoint = midpoint;
+    s.vignette.roundness = roundness;
+    s.vignette.feather = feather;
+    s.vignette.highlights = highlights;
+    s.grain.amount = grain_amount;
+    s.grain.size = grain_size;
+    s.grain.roughness = grain_roughness;
 }
 
 fn neutral_grading(s: &mut DevelopSettings) {
@@ -150,8 +180,7 @@ fn clear_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
     set_detail(&mut s, a, 30.0);
     neutral_grading(&mut s);
     set_curve(&mut s, 4.0, 2.0, -2.0, -4.0);
-    s.vignette.amount = 0.0;
-    s.grain.amount = 0.0;
+    set_finish(&mut s, 0.0, 0.0, 25.0, 50.0, 50.0, 0.0, 50.0, 0.0);
     s
 }
 
@@ -164,8 +193,7 @@ fn golden_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
     set_detail(&mut s, a, 28.0);
     set_grading(&mut s, wheel(30.0, 10.0, 4.0), wheel(35.0, 8.0, 2.0), wheel(40.0, 18.0, 5.0), wheel(35.0, 8.0, 0.0));
     set_curve(&mut s, 8.0, 4.0, -4.0, -8.0);
-    s.vignette.amount = -8.0;
-    s.grain.amount = 12.0;
+    set_finish(&mut s, -8.0, 12.0, 30.0, 60.0, 45.0, 10.0, 60.0, 10.0);
     s
 }
 
@@ -178,8 +206,7 @@ fn cool_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
     set_detail(&mut s, a, 34.0);
     set_grading(&mut s, wheel(220.0, 12.0, 2.0), wheel(210.0, 6.0, 0.0), wheel(200.0, 14.0, 4.0), wheel(210.0, 6.0, 0.0));
     set_curve(&mut s, 6.0, 3.0, -3.0, -6.0);
-    s.vignette.amount = -4.0;
-    s.grain.amount = 0.0;
+    set_finish(&mut s, -4.0, 0.0, 25.0, 50.0, 50.0, 0.0, 60.0, 0.0);
     s
 }
 
@@ -192,8 +219,7 @@ fn vivid_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
     set_detail(&mut s, a, 40.0);
     neutral_grading(&mut s);
     set_curve(&mut s, 10.0, 5.0, -5.0, -10.0);
-    s.vignette.amount = -6.0;
-    s.grain.amount = 0.0;
+    set_finish(&mut s, -6.0, 0.0, 25.0, 50.0, 50.0, 0.0, 50.0, 0.0);
     s
 }
 
@@ -214,8 +240,7 @@ fn matte_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
         Point::new(0.75, 0.79),
         Point::new(1.0, 0.97),
     ];
-    s.vignette.amount = -6.0;
-    s.grain.amount = 18.0;
+    set_finish(&mut s, -6.0, 18.0, 25.0, 65.0, 55.0, 0.0, 70.0, 0.0);
     s
 }
 
@@ -229,8 +254,7 @@ fn noir_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
     set_detail(&mut s, a, 35.0);
     neutral_grading(&mut s);
     set_curve(&mut s, 15.0, 8.0, -8.0, -15.0);
-    s.vignette.amount = -12.0;
-    s.grain.amount = 25.0;
+    set_finish(&mut s, -12.0, 25.0, 40.0, 70.0, 40.0, 20.0, 45.0, 0.0);
     s.treatment = Treatment::Bw;
     s
 }
@@ -244,8 +268,7 @@ fn soft_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
     set_detail(&mut s, a, 18.0);
     set_grading(&mut s, wheel(30.0, 6.0, 2.0), wheel(0.0, 0.0, 0.0), wheel(30.0, 8.0, 4.0), wheel(0.0, 0.0, 0.0));
     set_curve(&mut s, 5.0, 3.0, -2.0, 5.0);
-    s.vignette.amount = -8.0;
-    s.grain.amount = 8.0;
+    set_finish(&mut s, -8.0, 8.0, 30.0, 55.0, 55.0, 0.0, 65.0, 15.0);
     s
 }
 

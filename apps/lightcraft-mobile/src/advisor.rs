@@ -75,41 +75,26 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     if v.is_finite() { v.clamp(lo, hi) } else { 0.0_f64.clamp(lo, hi) }
 }
 
-/// sRGB EOTF inverse: a display-referred value to linear light. `Analysis::p50`
-/// is a display (gamma-encoded) median, so an exposure ratio computed from it
-/// directly understates the correction in stops; decoding both the median and
-/// the key target to linear light first gives a true EV. This decodes the
-/// median itself, which is an approximation of the median of the linear
-/// values: the exact linear median is not stored on `Analysis` (that would
-/// need an `analysis.rs` change), so the two agree only up to that
-/// approximation.
-fn srgb_decode(c: f64) -> f64 {
-    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-}
-
-/// The key target for a scene, in display units. Mirrors
-/// `analysis::key_target`; keep the two in sync.
-fn key_target(scene: Scene) -> f64 {
-    match scene {
-        Scene::Night => 0.22,
-        Scene::LowKey => 0.30,
-        Scene::HighKey => 0.60,
-        Scene::Backlit => 0.42,
-        _ => 0.45,
-    }
-}
+/// One shared threshold set for the summary, the tags, and the tips,
+/// so the three never disagree about the same photo: the summary
+/// must not call a photo underexposed that gets no exposure tip,
+/// and a tip must not fire for a condition the summary omits.
+const EXPOSURE_THRESHOLD: f64 = 0.3;
+const CLIP_THRESHOLD: f64 = 0.05;
+const CAST_THRESHOLD: f64 = 0.15;
+const HAZE_THRESHOLD: f64 = 0.35;
+const NOISE_THRESHOLD: f64 = 0.25;
+const SUBJECT_THRESHOLD: f64 = 0.35;
+const LOW_CONTRAST: f64 = 0.12;
 
 /// The Auto enhancement for this photo (what Auto at 100 % applies).
 pub fn enhance(a: &Analysis) -> DevelopSettings {
     let mut s = DevelopSettings::default();
-    // Exposure in linear light: decode the key target and the median, then
-    // take the log2 ratio (the clipped-highlights cap mirrors `analyze`).
-    let linear_p50 = srgb_decode(a.p50).max(1e-4);
-    let mut ev = (srgb_decode(key_target(a.scene)) / linear_p50).log2();
-    if a.clipped_highlights > 0.10 {
-        ev = ev.min(-0.25);
-    }
-    s.light.exposure = clamp(ev, -2.0, 2.0);
+    // Exposure is the analysis' stored correction, computed in
+    // linear light from the stored linear median. Reading it here
+    // (rather than recomputing from the gamma-encoded p50) keeps
+    // Auto and the exposure tip stating the same value.
+    s.light.exposure = clamp(a.exposure_correction, -2.0, 2.0);
     s.light.contrast = clamp((0.22 - a.contrast) * 250.0, -40.0, 50.0);
     let range_bonus = if a.dynamic_range_ev > 10.0 { 15.0 } else { 0.0 };
     s.light.highlights = clamp(-a.clipped_highlights * 400.0 - range_bonus, -85.0, 0.0);
@@ -141,6 +126,12 @@ pub fn enhance(a: &Analysis) -> DevelopSettings {
     s
 }
 
+/// The look that suits this photo. Every look is reachable: the
+/// scene arms come first, and for a General scene a cool cast
+/// (warmth <= -0.15, overcast/shade) suggests Cool and flat
+/// contrast (contrast < 0.12) suggests Matte. No scene returns
+/// `None` by design, so the look tip in `build_tips` always fires
+/// and the dead fallback tip it used to guard is gone.
 fn suggested_look(a: &Analysis) -> Option<&'static str> {
     Some(match a.scene {
         Scene::Portrait => "soft",
@@ -149,7 +140,11 @@ fn suggested_look(a: &Analysis) -> Option<&'static str> {
         Scene::Food => "vivid",
         Scene::Night | Scene::HighKey => "clear",
         Scene::General => {
-            if a.colorfulness >= 0.35 {
+            if a.warmth <= -CAST_THRESHOLD {
+                "cool"
+            } else if a.contrast < LOW_CONTRAST {
+                "matte"
+            } else if a.colorfulness >= 0.35 {
                 "vivid"
             } else {
                 "clear"
@@ -173,33 +168,35 @@ fn summary_kind(scene: Scene) -> &'static str {
 }
 
 fn build_summary(a: &Analysis) -> String {
+    // Parallel noun phrases throughout: no bare adjectives mixed
+    // with noun phrases ("underexposed, a warm cast, haze").
     let mut clauses: Vec<&str> = Vec::new();
-    if a.exposure_correction >= 0.5 {
-        clauses.push("underexposed");
-    } else if a.exposure_correction <= -0.5 {
-        clauses.push("overexposed");
+    if a.exposure_correction >= EXPOSURE_THRESHOLD {
+        clauses.push("underexposure");
+    } else if a.exposure_correction <= -EXPOSURE_THRESHOLD {
+        clauses.push("overexposure");
     }
-    if a.clipped_highlights >= 0.05 {
+    if a.clipped_highlights >= CLIP_THRESHOLD {
         clauses.push("clipped highlights");
     }
-    if a.clipped_shadows >= 0.05 {
+    if a.clipped_shadows >= CLIP_THRESHOLD {
         clauses.push("crushed shadows");
     }
-    if a.warmth >= 0.15 {
+    if a.warmth >= CAST_THRESHOLD {
         clauses.push("a warm cast");
-    } else if a.warmth <= -0.15 {
+    } else if a.warmth <= -CAST_THRESHOLD {
         clauses.push("a cool cast");
     }
-    if a.haze >= 0.4 {
+    if a.haze >= HAZE_THRESHOLD {
         clauses.push("haze");
     }
-    if a.noise >= 0.3 {
+    if a.noise >= NOISE_THRESHOLD {
         clauses.push("visible noise");
     }
-    if a.subject.confidence >= 0.4 {
+    if a.subject.confidence >= SUBJECT_THRESHOLD {
         clauses.push("a clear subject");
     }
-    if a.contrast < 0.12 {
+    if a.contrast < LOW_CONTRAST {
         clauses.push("low contrast");
     }
     let kind = summary_kind(a.scene);
@@ -215,9 +212,9 @@ fn build_tags(a: &Analysis) -> Vec<String> {
     if a.scene != Scene::General {
         tags.push(a.scene.label().to_string());
     }
-    if a.warmth >= 0.15 {
+    if a.warmth >= CAST_THRESHOLD {
         tags.push("Warm".to_string());
-    } else if a.warmth <= -0.15 {
+    } else if a.warmth <= -CAST_THRESHOLD {
         tags.push("Cool".to_string());
     }
     if a.mean < 0.25 {
@@ -227,13 +224,13 @@ fn build_tags(a: &Analysis) -> Vec<String> {
     }
     if a.contrast >= 0.28 {
         tags.push("High contrast".to_string());
-    } else if a.contrast < 0.12 {
+    } else if a.contrast < LOW_CONTRAST {
         tags.push("Flat".to_string());
     }
-    if a.haze >= 0.4 {
+    if a.haze >= HAZE_THRESHOLD {
         tags.push("Hazy".to_string());
     }
-    if a.noise >= 0.3 {
+    if a.noise >= NOISE_THRESHOLD {
         tags.push("Noisy".to_string());
     }
     if a.colorfulness >= 0.35 {
@@ -241,8 +238,11 @@ fn build_tags(a: &Analysis) -> Vec<String> {
     } else if a.colorfulness < 0.12 {
         tags.push("Muted".to_string());
     }
-    if a.clipped_highlights >= 0.05 {
+    if a.clipped_highlights >= CLIP_THRESHOLD {
         tags.push("Blown highlights".to_string());
+    }
+    if a.clipped_shadows >= CLIP_THRESHOLD {
+        tags.push("Deep shadows".to_string());
     }
     tags.truncate(3);
     tags
@@ -261,7 +261,7 @@ fn push_tip(tips: &mut Vec<Tip>, t: Tip) {
 fn build_tips(a: &Analysis, suggested: Option<&'static str>) -> Vec<Tip> {
     let mut tips: Vec<Tip> = Vec::new();
     let ev = clamp(a.exposure_correction, -2.0, 2.0);
-    if ev.abs() >= 0.3 {
+    if ev.abs() >= EXPOSURE_THRESHOLD {
         let direction = if ev > 0.0 { "brighten" } else { "darken" };
         push_tip(
             &mut tips,
@@ -273,29 +273,44 @@ fn build_tips(a: &Analysis, suggested: Option<&'static str>) -> Vec<Tip> {
             ),
         );
     }
-    if a.clipped_highlights >= 0.05 {
+    if a.clipped_highlights >= CLIP_THRESHOLD {
         push_tip(
             &mut tips,
             tip(
                 "highlights",
                 "Recover the highlights",
                 "Pull the brightest tones back so detail in the highlights comes back.".to_string(),
-                TipAction::Tune("highlights", -60.0),
+                // Measured recovery, mirroring `enhance()`: a fixed -60
+                // would over-recover mild clipping and under-recover
+                // severe clipping.
+                TipAction::Tune("highlights", clamp(-a.clipped_highlights * 400.0, -85.0, 0.0)),
             ),
         );
     }
-    if a.clipped_shadows >= 0.05 {
+    if a.clipped_shadows >= CLIP_THRESHOLD {
         push_tip(
             &mut tips,
             tip(
                 "shadows",
                 "Open the shadows",
                 "Lift the darkest tones so detail in the shadows comes back.".to_string(),
-                TipAction::Tune("shadows", 60.0),
+                TipAction::Tune("shadows", clamp(a.clipped_shadows * 400.0, 0.0, 85.0)),
             ),
         );
     }
-    if a.haze >= 0.35 {
+    if a.contrast < LOW_CONTRAST {
+        push_tip(
+            &mut tips,
+            tip(
+                "contrast",
+                "Add contrast",
+                "Lift the photo out of flatness with more tonal range.".to_string(),
+                // Mirrors `enhance()`: the same deficit, the same scale.
+                TipAction::Tune("contrast", clamp((0.22 - a.contrast) * 250.0, -40.0, 50.0)),
+            ),
+        );
+    }
+    if a.haze >= HAZE_THRESHOLD {
         push_tip(
             &mut tips,
             tip(
@@ -306,18 +321,29 @@ fn build_tips(a: &Analysis, suggested: Option<&'static str>) -> Vec<Tip> {
             ),
         );
     }
-    if a.warmth.abs() >= 0.15 {
+    if a.warmth.abs() >= CAST_THRESHOLD {
         push_tip(
             &mut tips,
             tip(
                 "warmth",
-                "Neutralise the colour cast",
-                "Shift the white balance back toward neutral.".to_string(),
+                "Fix the colour temperature",
+                "Shift the white balance temperature back toward neutral.".to_string(),
                 TipAction::Tune("warmth", clamp(-a.warmth * 80.0, -100.0, 100.0)),
             ),
         );
     }
-    if a.noise >= 0.25 {
+    if a.tint.abs() >= CAST_THRESHOLD {
+        push_tip(
+            &mut tips,
+            tip(
+                "tint",
+                "Fix the colour tint",
+                "Shift the white balance tint back toward neutral.".to_string(),
+                TipAction::Tune("tint", clamp(-a.tint * 120.0, -100.0, 100.0)),
+            ),
+        );
+    }
+    if a.noise >= NOISE_THRESHOLD {
         push_tip(
             &mut tips,
             tip(
@@ -328,18 +354,24 @@ fn build_tips(a: &Analysis, suggested: Option<&'static str>) -> Vec<Tip> {
             ),
         );
     }
-    if a.subject.confidence >= 0.35 {
+    if a.subject.confidence >= SUBJECT_THRESHOLD {
         push_tip(
             &mut tips,
             tip(
                 "focus",
                 "Bring out the subject",
-                "Brighten and sharpen the subject, and quiet the background.".to_string(),
+                // The focus mask brightens and adds clarity/texture to
+                // the subject; it sets no sharpness, and it quiets the
+                // background only when background focus is on, so the
+                // tip promises neither.
+                "Brighten the subject and bring out its texture.".to_string(),
                 TipAction::Focus(60.0),
             ),
         );
     }
     let off_centre = a.subject.cx < 0.32 || a.subject.cx > 0.68 || a.subject.cy < 0.32 || a.subject.cy > 0.68;
+    // The crop gate keeps its own lower confidence (0.2): placing a
+    // subject needs less certainty than calling it clear.
     if off_centre && a.subject.confidence >= 0.2 {
         push_tip(
             &mut tips,
@@ -360,17 +392,6 @@ fn build_tips(a: &Analysis, suggested: Option<&'static str>) -> Vec<Tip> {
                 "Try a look",
                 format!("The {name} look suits this photo. Tap to apply it."),
                 TipAction::Look(id, 70.0),
-            ),
-        );
-    }
-    if tips.is_empty() {
-        push_tip(
-            &mut tips,
-            tip(
-                "clarity",
-                "Add a little clarity",
-                "A touch of local contrast makes texture stand out.".to_string(),
-                TipAction::Tune("clarity", 15.0),
             ),
         );
     }
@@ -415,16 +436,78 @@ mod tests {
         a.clipped_highlights = 0.1;
         a.clipped_shadows = 0.1;
         let s = enhance(&a);
-        // Exposure is computed in linear light: decoding the 0.45 key and
-        // the 0.1 median gives a ratio that clamps at +2 EV, and the blacks
-        // recovery has no offset subtracted from it.
-        assert_eq!(s.light.exposure, 2.0);
+        // Exposure is the stored correction (computed in linear light
+        // by `analyze`); the blacks recovery has no offset subtracted.
+        assert_eq!(s.light.exposure, 1.2);
         assert_eq!(s.light.blacks, 15.0);
         assert!(s.light.highlights < 0.0 && s.light.shadows > 0.0);
         let advice = advise(&a);
         assert!(advice.summary.contains("clipped highlights"), "{}", advice.summary);
         assert_eq!(advice.tips[0].id, "exposure");
         assert!(matches!(advice.tips[0].action, Some(TipAction::Tune("exposure", v)) if (v - 1.2).abs() < 1e-9));
+    }
+
+    #[test]
+    fn enhance_agrees_with_the_stored_correction_on_a_real_photo() {
+        use crate::analysis::analyze;
+        use lightcraft_raster::Rgb32f;
+        let a = analyze(&Rgb32f::from_fn(16, 16, |_, _| [0.02, 0.02, 0.02]));
+        let s = enhance(&a);
+        assert!(a.exposure_correction > 0.0, "ev {}", a.exposure_correction);
+        assert_eq!(s.light.exposure, a.exposure_correction.clamp(-2.0, 2.0));
+    }
+
+    #[test]
+    fn highlight_and_shadow_tips_use_measured_clipping() {
+        let mut mild = Analysis::default();
+        mild.clipped_highlights = 0.05;
+        mild.clipped_shadows = 0.05;
+        let tips = advise(&mild).tips;
+        assert!(matches!(tips[0].action, Some(TipAction::Tune("highlights", v)) if (v + 20.0).abs() < 1e-9));
+        assert!(matches!(tips[1].action, Some(TipAction::Tune("shadows", v)) if (v - 20.0).abs() < 1e-9));
+        let mut severe = Analysis::default();
+        severe.clipped_highlights = 0.25;
+        severe.clipped_shadows = 0.25;
+        let tips = advise(&severe).tips;
+        assert!(matches!(tips[0].action, Some(TipAction::Tune("highlights", v)) if (v + 85.0).abs() < 1e-9));
+        assert!(matches!(tips[1].action, Some(TipAction::Tune("shadows", v)) if (v - 85.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn contrast_and_tint_tips_fire_on_their_own_gates() {
+        let mut a = Analysis::default();
+        a.contrast = 0.05;
+        a.tint = 0.3;
+        let tips = advise(&a).tips;
+        let ids: Vec<&str> = tips.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"contrast"), "{ids:?}");
+        assert!(ids.contains(&"tint"), "{ids:?}");
+        let contrast = tips.iter().find(|t| t.id == "contrast").expect("contrast tip");
+        assert!(matches!(contrast.action, Some(TipAction::Tune("contrast", v)) if (v - 42.5).abs() < 1e-9));
+        let tint = tips.iter().find(|t| t.id == "tint").expect("tint tip");
+        assert!(matches!(tint.action, Some(TipAction::Tune("tint", v)) if (v + 36.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn cool_and_matte_are_suggested_for_cast_and_flat_photos() {
+        let mut cool = Analysis::default();
+        cool.warmth = -0.2;
+        assert_eq!(advise(&cool).suggested_look, Some("cool"));
+        let mut flat = Analysis::default();
+        flat.contrast = 0.05;
+        assert_eq!(advise(&flat).suggested_look, Some("matte"));
+    }
+
+    #[test]
+    fn summary_uses_noun_phrases_and_tags_name_deep_shadows() {
+        let mut a = Analysis::default();
+        a.exposure_correction = 0.6;
+        let summary = advise(&a).summary;
+        assert!(summary.contains("underexposure"), "{summary}");
+        assert!(!summary.contains("underexposed"), "{summary}");
+        let mut b = Analysis::default();
+        b.clipped_shadows = 0.1;
+        assert!(advise(&b).tags.contains(&"Deep shadows".to_string()), "{:?}", advise(&b).tags);
     }
 
     #[test]

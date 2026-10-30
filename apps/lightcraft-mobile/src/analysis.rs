@@ -88,6 +88,12 @@ pub struct Analysis {
     pub p50: f64,
     pub p95: f64,
     pub p99: f64,
+    /// Median linear luminance (Rec.2020 luma, before display conversion).
+    /// The exposure correction is computed from this, not from the
+    /// gamma-encoded `p50`: decoding the median only approximates the
+    /// median of the linear values and understates the correction.
+    #[serde(default)]
+    pub linear_p50: f64,
     pub mean: f64,
     /// Standard deviation of display luma (global contrast).
     pub contrast: f64,
@@ -137,6 +143,8 @@ impl Default for Analysis {
             p50: 0.45,
             p95: 0.9,
             p99: 0.97,
+            // srgb_decode(0.45): the linear median matching the default p50.
+            linear_p50: 0.1707,
             mean: 0.45,
             contrast: 0.2,
             clipped_highlights: 0.0,
@@ -184,6 +192,11 @@ fn clean_channel(v: f32) -> f64 {
 
 fn srgb_encode(c: f64) -> f64 {
     if c <= 0.003_130_8 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// sRGB EOTF inverse: a display-referred value to linear light.
+fn srgb_decode(c: f64) -> f64 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
 /// Linear Rec.2020 pixel to display sRGB (0..1 per channel).
@@ -380,6 +393,9 @@ fn saliency_grid(width: usize, height: usize, luma: &[f64], display: &[[f64; 3]]
         let dy = (cy as f64 + 0.5) / gh as f64 - 0.45;
         let prior = (-(dx * dx + dy * dy) / (2.0 * 0.42 * 0.42)).exp();
         let (entropy, rarity) = if cell.count == 0 {
+            // No pixels here: no information, no colour, and no centre
+            // prior either. Scoring the prior alone would make empty
+            // cells (most of the grid on a tiny image) the peak.
             (0.0, 0.0)
         } else {
             let n = f64::from(cell.count);
@@ -387,7 +403,7 @@ fn saliency_grid(width: usize, height: usize, luma: &[f64], display: &[[f64; 3]]
             let dist = ((mean[0] - mean_rgb[0]).powi(2) + (mean[1] - mean_rgb[1]).powi(2) + (mean[2] - mean_rgb[2]).powi(2)).sqrt() / 3.0f64.sqrt();
             (shannon_entropy(&cell.hist) / (CELL_BINS as f64).log2(), clamp01(dist))
         };
-        let v = 0.45 * entropy + 0.35 * rarity + 0.20 * prior;
+        let v = if cell.count == 0 { 0.0 } else { 0.45 * entropy + 0.35 * rarity + 0.20 * prior };
         raw[idx] = v;
         peak = peak.max(v);
     }
@@ -442,7 +458,10 @@ fn subject_from(saliency: &[f32], gw: usize, gh: usize) -> Subject {
     let rx = (2.0 * (var_x / w_sum).sqrt() + 0.5 / gw as f64).clamp(0.05, 0.5);
     let ry = (2.0 * (var_y / w_sum).sqrt() + 0.5 / gh as f64).clamp(0.05, 0.5);
     let strong_mean = strong_sum / strong_n as f64;
-    let rest_mean = if rest_n > 0 { rest_sum / rest_n as f64 } else { 0.0 };
+    // No background at all means nothing stands out: confidence is 0,
+    // not the strong cells' own mean (which would call a uniformly
+    // textured frame a clear subject).
+    let rest_mean = if rest_n > 0 { rest_sum / rest_n as f64 } else { strong_mean };
     Subject { cx, cy, rx, ry, confidence: clamp01(strong_mean - rest_mean) }
 }
 
@@ -470,7 +489,11 @@ fn sky_fraction(width: usize, height: usize, luma: &[f64], display: &[[f64; 3]],
 }
 
 fn classify(a: &Analysis) -> Scene {
-    let subject_area = a.subject.rx * a.subject.ry;
+    // `rx`/`ry` are half extents, so the subject box covers
+    // (2*rx) * (2*ry) = 4*rx*ry of the frame. Using rx*ry alone
+    // caps the area at 0.25 and the Portrait gate below could
+    // never fail, even for a whole-frame subject.
+    let subject_area = 4.0 * a.subject.rx * a.subject.ry;
     if a.colorfulness < 0.08 && a.saturation < 0.08 {
         Scene::Monochrome
     } else if a.p50 < 0.12 && a.mean < 0.18 {
@@ -532,13 +555,20 @@ pub fn analyze(img: &Rgb32f) -> Analysis {
     let std_rg = (c.rg_sq / n - mean_rg * mean_rg).max(0.0).sqrt();
     let std_yb = (c.yb_sq / n - mean_yb * mean_yb).max(0.0).sqrt();
     let colorfulness = (std_rg.powi(2) + std_yb.powi(2)).sqrt() + 0.3 * (mean_rg.powi(2) + mean_yb.powi(2)).sqrt();
+    let mean_rgb = [c.mean_rgb[0] / n, c.mean_rgb[1] / n, c.mean_rgb[2] / n];
     let neutral = c.neutral_n as f64;
     let (warmth, tint) = if neutral > 0.0 {
         ((c.neutral_rb / neutral * 2.5).clamp(-1.0, 1.0), (c.neutral_tint / neutral * 2.5).clamp(-1.0, 1.0))
     } else {
-        (0.0, 0.0)
+        // No near-neutral pixel qualified (e.g. a uniformly warm grey,
+        // whose saturation is too high to count as neutral). Fall back
+        // to the whole-image mean cast, or Auto white balance would
+        // report a cast photo as neutral and do nothing.
+        (
+            ((mean_rgb[0] - mean_rgb[2]) * 2.5).clamp(-1.0, 1.0),
+            ((0.5 * (mean_rgb[0] + mean_rgb[2]) - mean_rgb[1]) * 2.5).clamp(-1.0, 1.0),
+        )
     };
-    let mean_rgb = [c.mean_rgb[0] / n, c.mean_rgb[1] / n, c.mean_rgb[2] / n];
     let (hp, detail, noise) = high_pass(width, height, &c.luma);
     let (grid_w, grid_h, saliency) = saliency_grid(width, height, &c.luma, &c.display, mean_rgb);
     let subject = subject_from(&saliency, grid_w, grid_h);
@@ -552,6 +582,7 @@ pub fn analyze(img: &Rgb32f) -> Analysis {
         p50: percentile(&luma_sorted, 0.5),
         p95: percentile(&luma_sorted, 0.95),
         p99: percentile(&luma_sorted, 0.99),
+        linear_p50: percentile(&linear_sorted, 0.5).max(1e-4),
         mean,
         contrast,
         clipped_highlights,
@@ -576,7 +607,10 @@ pub fn analyze(img: &Rgb32f) -> Analysis {
         scene: Scene::General,
     };
     a.scene = classify(&a);
-    let mut ev = (key_target(a.scene) / a.p50.max(0.02)).log2();
+    // Exposure in linear light: the key target decoded to linear over
+    // the stored linear median. (The old form divided the display key
+    // by the gamma-encoded p50 and under-corrected by ~0.8-1.2 stops.)
+    let mut ev = (srgb_decode(key_target(a.scene)) / a.linear_p50).log2();
     if a.clipped_highlights > 0.10 {
         ev = ev.min(-0.25);
     }
@@ -664,5 +698,59 @@ mod tests {
         assert!(a.exposure_correction > 0.0, "ev {}", a.exposure_correction);
         // Colourless before dark in the classification order: pure black is monochrome.
         assert_eq!(a.scene, Scene::Monochrome);
+    }
+
+    #[test]
+    fn linear_median_is_stored_and_drives_exposure() {
+        // Linear grey 0.5: the linear median is 0.5, and the correction
+        // brings the 0.45 key down from it in linear light (-1.55 EV),
+        // not the -0.71 EV the gamma-encoded p50 gave.
+        let a = analyze(&Rgb32f::from_fn(32, 32, |_, _| [0.5, 0.5, 0.5]));
+        assert!((a.linear_p50 - 0.5).abs() < 1e-9, "linear_p50 {}", a.linear_p50);
+        assert!((a.exposure_correction + 1.55).abs() < 0.05, "ev {}", a.exposure_correction);
+    }
+
+    #[test]
+    fn uniform_cast_photo_reports_a_cast_without_neutral_pixels() {
+        // A saturated warm image has no near-neutral pixel, so the
+        // whole-image mean cast must stand in: warmth must be clearly
+        // positive, not the old silent 0.0.
+        let a = analyze(&Rgb32f::from_fn(16, 16, |_, _| [1.0, 0.0, 0.0]));
+        assert!(a.warmth > 0.5, "warmth {}", a.warmth);
+        assert!(a.tint.is_finite());
+    }
+
+    #[test]
+    fn uniform_saliency_has_no_subject_confidence() {
+        // Every cell equally salient: no background, nothing stands
+        // out, so confidence is 0.
+        let s = subject_from(&[1.0f32; 4], 2, 2);
+        assert_eq!(s.confidence, 0.0);
+    }
+
+    #[test]
+    fn portrait_gate_uses_the_full_subject_box_area() {
+        // Half extents 0.3 cover 36% of the frame: too big for Portrait.
+        // Half extents 0.2 cover 16%: a Portrait.
+        let mut big = Analysis::default();
+        big.skin = 0.1;
+        big.subject.confidence = 0.2;
+        big.subject.rx = 0.3;
+        big.subject.ry = 0.3;
+        assert_ne!(classify(&big), Scene::Portrait);
+        let mut small = big.clone();
+        small.subject.rx = 0.2;
+        small.subject.ry = 0.2;
+        assert_eq!(classify(&small), Scene::Portrait);
+    }
+
+    #[test]
+    fn empty_saliency_cells_score_zero() {
+        // A 1x1 photo fills one grid cell; every other cell is empty
+        // and must score 0, not the centre prior alone.
+        let a = analyze(&Rgb32f::from_fn(1, 1, |_, _| [0.5, 0.5, 0.5]));
+        assert_eq!(a.saliency.len(), a.grid_w * a.grid_h);
+        assert_eq!(a.saliency.iter().filter(|&&s| s == 0.0).count(), a.saliency.len() - 1);
+        assert!(a.saliency.iter().any(|&s| s == 1.0));
     }
 }
