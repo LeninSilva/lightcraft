@@ -47,13 +47,22 @@
       // Streaming compile needs the right MIME type; a host that serves
       // .wasm as application/octet-stream makes it reject a valid module,
       // so fall back to fetching the bytes and compiling them directly.
+      // The served Content-Type is stashed on window for the ?debug=1
+      // probe in the wasm module; reading headers consumes nothing, and
+      // passing the Response (not a promise) to compileStreaming is
+      // equivalent. Loading text is unchanged.
       let module;
+      let wasmContentType = null;
       try {
-        module = await WebAssembly.compileStreaming(fetch("./lightcraft_mobile_bg.wasm"));
+        const res = await fetch("./lightcraft_mobile_bg.wasm");
+        try { wasmContentType = res.headers.get("content-type"); } catch (_) {}
+        module = await WebAssembly.compileStreaming(res);
       } catch (_) {
         const res = await fetch("./lightcraft_mobile_bg.wasm");
+        try { wasmContentType = res.headers.get("content-type"); } catch (_) {}
         module = await WebAssembly.compile(await res.arrayBuffer());
       }
+      window.__lightcraftWasmContentType = wasmContentType;
       await init({ module_or_path: module });
       start();
     })().catch((e) => {
