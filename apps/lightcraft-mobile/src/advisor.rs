@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use lightcraft_develop::{DevelopSettings, WbMode};
+use lightcraft_develop::{DevelopSettings, Treatment, WbMode};
 
 use crate::analysis::{Analysis, Scene};
 use crate::recipe::Recipe;
@@ -111,9 +111,19 @@ pub fn enhance(a: &Analysis) -> DevelopSettings {
     if a.scene != Scene::Monochrome {
         s.color.vibrance = clamp((0.35 - a.saturation) * 150.0, -20.0, 40.0);
         s.color.saturation = clamp((0.32 - a.saturation) * 80.0, -15.0, 25.0);
+    } else {
+        // A photo the analysis already reads as black and white gets
+        // the B&W treatment and a mix shaped by its own colour, so
+        // Auto's settings say what the photo already is instead of
+        // leaving the treatment at colour with the mix at zero.
+        s.treatment = Treatment::Bw;
+        s.bw_mix = crate::looks::bw_mix(a);
     }
     s.effects.clarity = clamp(10.0 + (0.20 - a.contrast) * 50.0 - a.noise * 30.0, 0.0, 30.0);
-    s.effects.texture = 8.0;
+    // Texture follows the measured detail and noise instead of a bare
+    // constant: detailed photos get more, noisy photos get less, and a
+    // flat default analysis still lands on the old 8.0.
+    s.effects.texture = clamp(8.0 + a.detail * 20.0 - a.noise * 20.0, 0.0, 18.0);
     s.effects.dehaze = clamp(a.haze * 60.0, 0.0, 50.0);
     s.detail.sharpen_amount = clamp(35.0 - a.noise * 150.0, 10.0, 50.0);
     s.detail.nr_luminance = clamp(a.noise * 80.0, 0.0, 60.0);
@@ -127,20 +137,32 @@ pub fn enhance(a: &Analysis) -> DevelopSettings {
 }
 
 /// The look that suits this photo. Every look is reachable: the
-/// scene arms come first, and for a General scene a cool cast
-/// (warmth <= -0.15, overcast/shade) suggests Cool and flat
-/// contrast (contrast < 0.12) suggests Matte. No scene returns
+/// scene arms come first, and for a General scene darkness suggests
+/// Night, a wide measured range suggests HDR, and a skin-heavy frame
+/// the classifier left General (a close face) suggests Portrait,
+/// before the cool-cast and flat-contrast arms. No scene returns
 /// `None` by design, so the look tip in `build_tips` always fires
-/// and the dead fallback tip it used to guard is gone.
+/// and the dead fallback tip it used to guard is gone. Soft is the
+/// one look no suggestion arm names: it stays in the list for the
+/// user to pick by hand.
 fn suggested_look(a: &Analysis) -> Option<&'static str> {
     Some(match a.scene {
-        Scene::Portrait => "soft",
-        Scene::Landscape | Scene::Backlit => "golden",
-        Scene::LowKey | Scene::Monochrome => "noir",
+        Scene::Portrait => "portrait",
+        Scene::Landscape => "golden",
+        Scene::Backlit => "hdr",
+        Scene::LowKey => "noir",
+        Scene::Monochrome => "mono",
         Scene::Food => "vivid",
-        Scene::Night | Scene::HighKey => "clear",
+        Scene::Night => "night",
+        Scene::HighKey => "clear",
         Scene::General => {
-            if a.warmth <= -CAST_THRESHOLD {
+            if a.mean < 0.25 {
+                "night"
+            } else if a.dynamic_range_ev >= 11.0 {
+                "hdr"
+            } else if a.skin >= 0.07 && a.subject.confidence >= 0.15 {
+                "portrait"
+            } else if a.warmth <= -CAST_THRESHOLD {
                 "cool"
             } else if a.contrast < LOW_CONTRAST {
                 "matte"
@@ -536,8 +558,58 @@ mod tests {
     fn suggested_look_follows_the_scene() {
         let mut a = Analysis::default();
         a.scene = Scene::Portrait;
-        assert_eq!(advise(&a).suggested_look, Some("soft"));
+        assert_eq!(advise(&a).suggested_look, Some("portrait"));
         a.scene = Scene::Monochrome;
+        assert_eq!(advise(&a).suggested_look, Some("mono"));
+        a.scene = Scene::Night;
+        assert_eq!(advise(&a).suggested_look, Some("night"));
+        a.scene = Scene::Backlit;
+        assert_eq!(advise(&a).suggested_look, Some("hdr"));
+        a.scene = Scene::LowKey;
         assert_eq!(advise(&a).suggested_look, Some("noir"));
+    }
+
+    #[test]
+    fn every_new_look_is_reachable_from_general_stats() {
+        // No scene arm: darkness, range, and skin alone must each
+        // reach their look from a General scene.
+        let mut dark = Analysis::default();
+        dark.mean = 0.1;
+        assert_eq!(advise(&dark).suggested_look, Some("night"));
+        let mut wide = Analysis::default();
+        wide.dynamic_range_ev = 12.0;
+        assert_eq!(advise(&wide).suggested_look, Some("hdr"));
+        let mut face = Analysis::default();
+        face.skin = 0.1;
+        face.subject.confidence = 0.2;
+        assert_eq!(advise(&face).suggested_look, Some("portrait"));
+        // Every suggested id resolves to a listed look.
+        for id in ["mono", "portrait", "night", "hdr"] {
+            assert!(crate::looks::look(id).is_some(), "{id}");
+        }
+    }
+
+    #[test]
+    fn monochrome_enhance_sets_black_and_white_treatment() {
+        let mut a = Analysis::default();
+        a.scene = Scene::Monochrome;
+        a.warmth = 0.4;
+        let s = enhance(&a);
+        assert_eq!(s.treatment, Treatment::Bw);
+        assert!(s.bw_mix.red > 0.0, "red {}", s.bw_mix.red);
+        // Colour scenes keep the colour treatment.
+        let colour = enhance(&Analysis::default());
+        assert_eq!(colour.treatment, Treatment::Color);
+    }
+
+    #[test]
+    fn texture_follows_detail_and_noise() {
+        let mut detailed = Analysis::default();
+        detailed.detail = 0.3;
+        assert!(enhance(&detailed).effects.texture > 8.0);
+        let mut noisy = Analysis::default();
+        noisy.noise = 0.5;
+        assert!(enhance(&noisy).effects.texture < 8.0);
+        assert_eq!(enhance(&Analysis::default()).effects.texture, 8.0);
     }
 }

@@ -9,7 +9,7 @@
 //! so a look at 10% strength does not yet carry the look's full hue shift; `treatment`
 //! is the one field that snaps, to the look's value once the strength reaches 50%.
 
-use lightcraft_develop::{DevelopSettings, Treatment, WbMode, Wheel};
+use lightcraft_develop::{BwMix, DevelopSettings, Treatment, WbMode, Wheel};
 use lightcraft_geom::Point;
 
 use crate::analysis::Analysis;
@@ -32,6 +32,10 @@ pub const LOOKS: &[Look] = &[
     Look { id: "matte", name: "Matte", blurb: "Lifted blacks and muted colour, like film" },
     Look { id: "noir", name: "Noir", blurb: "Black and white, deep shadows, grain" },
     Look { id: "soft", name: "Soft", blurb: "Low contrast and warm light for faces" },
+    Look { id: "mono", name: "Monochrome", blurb: "Black and white shaped by the photo's own tones" },
+    Look { id: "portrait", name: "Portrait", blurb: "Soft light and gentle skin tones for faces" },
+    Look { id: "night", name: "Night", blurb: "Lifted shadows and calm noise for low light" },
+    Look { id: "hdr", name: "HDR", blurb: "Recovered highlights and shadows for high-range light" },
 ];
 
 /// Find a look by id.
@@ -53,9 +57,17 @@ fn srgb_decode(c: f64) -> f64 {
 }
 
 /// Exposure that moves the photo's median luma to `target` (stops, capped),
-/// computed in linear light.
+/// computed in linear light from the stored linear median. Decoding the
+/// gamma-encoded `p50` only approximates that median and understates the
+/// correction, the error the advisor used to make before the correction
+/// was stored in linear light; analyses without a usable stored median
+/// (zero, or non-finite) fall back to decoding `p50`.
 fn aim_exposure(a: &Analysis, target: f64) -> f64 {
-    let linear_p50 = srgb_decode(a.p50).max(1e-4);
+    let linear_p50 = if a.linear_p50 > 0.0 && a.linear_p50.is_finite() {
+        a.linear_p50
+    } else {
+        srgb_decode(a.p50).max(1e-4)
+    };
     (srgb_decode(target) / linear_p50).log2().clamp(-1.5, 1.5)
 }
 
@@ -167,6 +179,24 @@ fn set_finish(
     s.grain.roughness = grain_roughness;
 }
 
+/// B&W mix from the photo's own colour: warm photos lighten their reds and
+/// oranges, a real sky darkens its blues, foliage lightens its greens.
+/// Only the pipeline's B&W path reads these bands, so on a colour render
+/// they are inert. The values are stylistic weightings of measured stats,
+/// not a simulation of any film stock's filter factors.
+pub fn bw_mix(a: &Analysis) -> BwMix {
+    BwMix {
+        red: clamp(a.warmth * 30.0, -30.0, 30.0),
+        orange: clamp(a.warmth * 25.0, -25.0, 25.0),
+        yellow: clamp(a.warmth * 20.0, -20.0, 20.0),
+        green: clamp(a.foliage * 60.0 - 10.0, -30.0, 40.0),
+        aqua: clamp(a.sky * 20.0, 0.0, 20.0),
+        blue: clamp(-a.sky * 50.0 - a.warmth * 10.0, -60.0, 20.0),
+        purple: 0.0,
+        magenta: clamp(a.tint * 20.0, -20.0, 20.0),
+    }
+}
+
 fn neutral_grading(s: &mut DevelopSettings) {
     set_grading(s, wheel(0.0, 0.0, 0.0), wheel(0.0, 0.0, 0.0), wheel(0.0, 0.0, 0.0), wheel(0.0, 0.0, 0.0));
 }
@@ -272,6 +302,93 @@ fn soft_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
     s
 }
 
+/// Faithful black and white, unlike Noir's stylised version: the tonal
+/// curve follows the measured dynamic range, the B&W mix follows the
+/// photo's own warmth, sky and foliage, and the grain stays low. Colour
+/// settings are zeroed because the pipeline ignores them under `Bw`
+/// only when they are non-positive; leaving a base's saturation in
+/// place would tint nothing, but zeroing keeps the settings honest.
+fn mono_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
+    let mut s = base.clone();
+    let range = clamp(a.dynamic_range_ev - 8.0, 0.0, 6.0);
+    set_light(&mut s, a, 0.46, 0.22 + range * 0.01, -5.0, 5.0);
+    set_white_balance(&mut s, a, 0.0, 0.0);
+    s.color.vibrance = 0.0;
+    s.color.saturation = 0.0;
+    let curve = clamp(8.0 + range, 4.0, 14.0);
+    set_effects(&mut s, a, clamp(10.0 + (0.22 - a.contrast) * 60.0, 0.0, 30.0), clamp(8.0 + a.detail * 20.0 - a.noise * 20.0, 0.0, 18.0), a.haze * 45.0);
+    set_detail(&mut s, a, 35.0);
+    neutral_grading(&mut s);
+    set_curve(&mut s, curve, curve * 0.5, -curve * 0.5, -curve);
+    set_finish(&mut s, -6.0, clamp(12.0 - a.noise * 20.0, 0.0, 12.0), 30.0, 55.0, 50.0, 0.0, 55.0, 0.0);
+    s.treatment = Treatment::Bw;
+    s.bw_mix = bw_mix(a);
+    s
+}
+
+/// Portrait-aware: the more skin the analysis found, the softer the
+/// clarity/texture/sharpening and the warmer the white balance; the
+/// vignette follows the detected subject's confidence, so a clear
+/// central subject gets more edge falloff than an uncertain one.
+fn portrait_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
+    let mut s = base.clone();
+    let skin_drive = clamp(a.skin * 3.0, 0.0, 1.0);
+    set_light(&mut s, a, 0.48, 0.20 - skin_drive * 0.05, -10.0, 10.0 + skin_drive * 5.0);
+    set_white_balance(&mut s, a, 0.10 + skin_drive * 0.08, 0.05);
+    set_colour(&mut s, a, 0.30, 0.0);
+    set_effects(&mut s, a, -(10.0 + skin_drive * 12.0), -(6.0 + skin_drive * 8.0), 0.0);
+    set_detail(&mut s, a, 24.0 - skin_drive * 10.0);
+    set_grading(
+        &mut s,
+        wheel(30.0, 6.0 + skin_drive * 4.0, 2.0),
+        wheel(0.0, 0.0, 0.0),
+        wheel(35.0, 8.0, 4.0),
+        wheel(0.0, 0.0, 0.0),
+    );
+    set_curve(&mut s, 5.0, 3.0, -2.0, 3.0 + skin_drive * 3.0);
+    set_finish(&mut s, -(6.0 + a.subject.confidence * 8.0), clamp(6.0 - a.noise * 10.0, 0.0, 8.0), 30.0, 55.0, 55.0, 0.0, 65.0, 15.0);
+    s
+}
+
+/// Low light: the darker the photo, the higher the key the exposure aims
+/// for and the more the shadows open; sharpening stays low and noise
+/// reduction rises with the measured noise, so a noisy night shot is
+/// calmed rather than sharpened into grain.
+fn night_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
+    let mut s = base.clone();
+    let dark = clamp((0.35 - a.mean) / 0.35, 0.0, 1.0);
+    set_light(&mut s, a, 0.32 + dark * 0.10, 0.20, -5.0, 10.0 + dark * 20.0);
+    set_white_balance(&mut s, a, 0.05, 0.0);
+    set_colour(&mut s, a, 0.30, 0.0);
+    set_effects(&mut s, a, clamp(8.0 - a.noise * 20.0, 0.0, 12.0), clamp(4.0 - a.noise * 15.0, 0.0, 8.0), a.haze * 30.0);
+    set_detail(&mut s, a, 20.0);
+    s.detail.nr_luminance = clamp(s.detail.nr_luminance + dark * 15.0, 0.0, 60.0);
+    set_grading(&mut s, wheel(220.0, 4.0 + dark * 6.0, 0.0), wheel(0.0, 0.0, 0.0), wheel(40.0, 10.0, 3.0), wheel(0.0, 0.0, 0.0));
+    set_curve(&mut s, 4.0, 2.0, 2.0, 4.0 + dark * 6.0);
+    set_finish(&mut s, -(4.0 + dark * 4.0), clamp(10.0 - a.noise * 15.0, 0.0, 10.0), 35.0, 55.0, 50.0, 0.0, 60.0, 0.0);
+    s
+}
+
+/// High dynamic range: recovery, clarity and the tone curve all scale
+/// with the measured range in stops, so a flat photo gets a gentle
+/// version and a backlit, both-ends-clipped photo gets the full
+/// treatment. The range term comes from `dynamic_range_ev` and the
+/// clipping terms from `recover`, never from a fixed offset.
+fn hdr_look(a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
+    let mut s = base.clone();
+    let range = clamp((a.dynamic_range_ev - 8.0) / 4.0, 0.0, 1.0);
+    set_light(&mut s, a, 0.45, 0.26 + range * 0.04, -range * 15.0, range * 15.0);
+    set_white_balance(&mut s, a, 0.05, 0.0);
+    set_colour(&mut s, a, 0.40 + range * 0.10, 5.0);
+    set_effects(&mut s, a, 15.0 + range * 15.0, 8.0 + range * 6.0, a.haze * 50.0 + range * 5.0);
+    set_detail(&mut s, a, 40.0);
+    neutral_grading(&mut s);
+    let curve = 8.0 + range * 6.0;
+    set_curve(&mut s, curve, curve * 0.5, -curve * 0.5, -curve);
+    set_finish(&mut s, -6.0, 0.0, 25.0, 50.0, 50.0, 0.0, 50.0, 0.0);
+    s
+}
+
 /// `base` with look `id` applied for this photo (at full strength; the recipe blends). An
 /// unknown id returns `base` unchanged.
 pub fn apply(id: &str, a: &Analysis, base: &DevelopSettings) -> DevelopSettings {
@@ -283,6 +400,10 @@ pub fn apply(id: &str, a: &Analysis, base: &DevelopSettings) -> DevelopSettings 
         "matte" => matte_look(a, base),
         "noir" => noir_look(a, base),
         "soft" => soft_look(a, base),
+        "mono" => mono_look(a, base),
+        "portrait" => portrait_look(a, base),
+        "night" => night_look(a, base),
+        "hdr" => hdr_look(a, base),
         _ => base.clone(),
     }
 }
@@ -292,7 +413,11 @@ mod tests {
     use super::*;
 
     fn analysis(p50: f64) -> Analysis {
-        Analysis { p50, mean: p50, ..Analysis::default() }
+        // A coherent analysis: the stored linear median matches the
+        // display median, as `analyze` produces. Without this the
+        // exposure aim (which reads the linear median) would be the
+        // same for every `p50` in the test.
+        Analysis { p50, mean: p50, linear_p50: srgb_decode(p50), ..Analysis::default() }
     }
 
     #[test]
@@ -303,7 +428,7 @@ mod tests {
             assert!(look(l.id).is_some(), "{}", l.id);
             assert_eq!(apply(l.id, &a, &base), apply(l.id, &a, &base), "{}", l.id);
         }
-        assert_eq!(LOOKS.len(), 7);
+        assert_eq!(LOOKS.len(), 11);
     }
 
     #[test]
@@ -365,6 +490,108 @@ mod tests {
         assert_eq!(apply("soft", &a, &base).effects.dehaze, 0.0);
         // Clear folds its own haze term in: 0.5 * 55.
         assert_eq!(apply("clear", &a, &base).effects.dehaze, 27.5);
+    }
+
+    #[test]
+    fn exposure_aim_reads_the_stored_linear_median() {
+        // Same display median, different stored linear medians: the
+        // darker linear median needs more exposure. The fallback only
+        // fires for a missing median.
+        let base = DevelopSettings::default();
+        let mut dark_linear = analysis(0.45);
+        dark_linear.linear_p50 = 0.05;
+        let mut bright_linear = analysis(0.45);
+        bright_linear.linear_p50 = 0.4;
+        assert!(apply("clear", &dark_linear, &base).light.exposure > apply("clear", &bright_linear, &base).light.exposure);
+        let mut missing = analysis(0.2);
+        missing.linear_p50 = 0.0;
+        let fallback = apply("clear", &missing, &base).light.exposure;
+        assert!(fallback > 0.0, "fallback {fallback}");
+    }
+
+    #[test]
+    fn mono_is_black_and_white_with_a_stat_driven_mix() {
+        let base = DevelopSettings::default();
+        let mut warm_sky = analysis(0.45);
+        warm_sky.warmth = 0.5;
+        warm_sky.sky = 0.6;
+        let mono = apply("mono", &warm_sky, &base);
+        assert_eq!(mono.treatment, Treatment::Bw);
+        assert_eq!(mono.color.saturation, 0.0);
+        assert!(mono.bw_mix.red > 0.0, "red {}", mono.bw_mix.red);
+        assert!(mono.bw_mix.blue < 0.0, "blue {}", mono.bw_mix.blue);
+        let neutral = apply("mono", &analysis(0.45), &base);
+        assert_eq!(neutral.bw_mix.red, 0.0);
+        assert_eq!(neutral.bw_mix.blue, 0.0);
+        let mut leafy = analysis(0.45);
+        leafy.foliage = 0.5;
+        assert!(apply("mono", &leafy, &base).bw_mix.green > neutral.bw_mix.green);
+        // The tone curve strengthens with measured dynamic range.
+        let mut flat = analysis(0.45);
+        flat.dynamic_range_ev = 8.0;
+        let mut wide = analysis(0.45);
+        wide.dynamic_range_ev = 14.0;
+        assert!(apply("mono", &wide, &base).curve.highlights > apply("mono", &flat, &base).curve.highlights);
+    }
+
+    #[test]
+    fn portrait_softens_and_warms_as_skin_rises() {
+        let base = DevelopSettings::default();
+        let mut no_skin = analysis(0.45);
+        no_skin.skin = 0.0;
+        let mut skin = analysis(0.45);
+        skin.skin = 0.4;
+        let plain = apply("portrait", &no_skin, &base);
+        let faces = apply("portrait", &skin, &base);
+        assert!(faces.effects.clarity < plain.effects.clarity, "{} {}", faces.effects.clarity, plain.effects.clarity);
+        assert!(faces.effects.texture < plain.effects.texture);
+        assert!(faces.wb.temp > plain.wb.temp);
+        // The vignette follows the detected subject's confidence.
+        let mut unsure = analysis(0.45);
+        unsure.subject.confidence = 0.1;
+        let mut sure = analysis(0.45);
+        sure.subject.confidence = 0.9;
+        assert!(apply("portrait", &sure, &base).vignette.amount < apply("portrait", &unsure, &base).vignette.amount);
+    }
+
+    #[test]
+    fn night_opens_shadows_as_darkness_grows_and_calms_noise() {
+        let base = DevelopSettings::default();
+        let mut dim = analysis(0.45);
+        dim.mean = 0.1;
+        let mut brighter = analysis(0.45);
+        brighter.mean = 0.3;
+        let night_dim = apply("night", &dim, &base);
+        let night_brighter = apply("night", &brighter, &base);
+        assert!(night_dim.light.exposure > night_brighter.light.exposure);
+        assert!(night_dim.light.shadows > night_brighter.light.shadows);
+        let mut noisy = analysis(0.45);
+        noisy.mean = 0.1;
+        noisy.noise = 0.5;
+        let mut quiet = analysis(0.45);
+        quiet.mean = 0.1;
+        quiet.noise = 0.0;
+        let noisy_settings = apply("night", &noisy, &base);
+        let quiet_settings = apply("night", &quiet, &base);
+        assert!(noisy_settings.detail.nr_luminance > quiet_settings.detail.nr_luminance);
+        assert!(noisy_settings.detail.sharpen_amount < quiet_settings.detail.sharpen_amount);
+    }
+
+    #[test]
+    fn hdr_recovers_more_as_range_grows() {
+        let base = DevelopSettings::default();
+        let mut flat = analysis(0.45);
+        flat.dynamic_range_ev = 8.0;
+        flat.clipped_highlights = 0.1;
+        flat.clipped_shadows = 0.1;
+        let mut wide = flat.clone();
+        wide.dynamic_range_ev = 14.0;
+        let flat_settings = apply("hdr", &flat, &base);
+        let wide_settings = apply("hdr", &wide, &base);
+        assert!(wide_settings.light.highlights < flat_settings.light.highlights);
+        assert!(wide_settings.light.shadows > flat_settings.light.shadows);
+        assert!(wide_settings.effects.clarity > flat_settings.effects.clarity);
+        assert!(wide_settings.color.vibrance > flat_settings.color.vibrance);
     }
 
     #[test]
