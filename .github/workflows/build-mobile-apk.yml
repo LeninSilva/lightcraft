@@ -9,7 +9,7 @@ name: Build LightCraft Mobile APK
 # Debug APK: sideload only, not Play Store signed.
 # Capacitor is pinned: exact versions in package.json at the repo root,
 # installed with --save-exact below (no package-lock.json is committed),
-# and the shell is built against the committed capacitor.config.ts.
+# and the shell is built against the committed capacitor.config.json.
 # Do NOT reintroduce `npx cap init`: it merges/rewrites that config
 # depending on CLI version, so the workflow uses `cap add` + `cap sync`.
 
@@ -105,11 +105,11 @@ jobs:
         run: |
           # Exact pins (Capacitor 8.6.0 core/cli/android, assets 3.0.5),
           # matching the committed package.json. No `npx cap init`: the
-          # committed capacitor.config.ts already holds appId/appName/
+          # committed capacitor.config.json already holds appId/appName/
           # webDir/scheme/splash settings, and `cap add` reads it.
-          npm install --save-exact @capacitor/core@8.6.0 @capacitor/cli@8.6.0 @capacitor/android@8.6.0 @capacitor/assets@3.0.5 @capacitor/filesystem@8.1.5 @capacitor/share@8.0.3
+          npm install --save-exact @capacitor/core@8.6.0 @capacitor/cli@8.6.0 @capacitor/android@8.6.0 @capacitor/assets@3.0.5 @capacitor/filesystem@8.1.5 @capacitor/share@8.0.3 @capacitor/splash-screen@8.0.2
           npx cap add android
-          npx capacitor-assets generate --android --iconBackgroundColor '#f2a516' --splashBackgroundColor '#1c1c1c'
+          npx capacitor-assets generate --android --assetPath resources --iconBackgroundColor '#f2a516' --splashBackgroundColor '#1c1c1c'
           # Same Kotlin stdlib duplicate fix as the desktop-port APK build.
           printf '\nconfigurations.all { exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk7" }\nconfigurations.all { exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk8" }\n' >> android/app/build.gradle
           npx cap sync
