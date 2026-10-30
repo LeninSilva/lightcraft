@@ -1,0 +1,1 @@
+{"appId":"ai.storyteller.lightcraft","appName":"LightCraft","plugins":{"SplashScreen":{"androidScaleType":"CENTER_CROP","androidSplashResourceName":"splash","backgroundColor":"#1c1c1c","launchAutoHide":true,"launchFadeOutDuration":500,"launchShowDuration":2000,"showSpinner":false,"splashFullScreen":true,"splashImmersive":false}},"server":{"androidScheme":"https"},"webDir":"www"}
