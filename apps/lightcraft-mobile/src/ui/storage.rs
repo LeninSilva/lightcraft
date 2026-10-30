@@ -8,6 +8,8 @@
 //! [`crate::library`]. The IndexedDB database is deliberately separate from the desktop
 //! web app's (`lightcraft-mobile`, not `lightcraft`), so the two apps never share a store.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use js_sys::{Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
@@ -25,6 +27,20 @@ pub enum Backend {
 
 fn err(e: JsValue) -> String {
     e.as_string().or_else(|| e.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message()))).unwrap_or_else(|| format!("{e:?}"))
+}
+
+/// The `name` of a DOMException / JS error value, when it has one.
+fn dom_name(e: &JsValue) -> Option<String> {
+    Reflect::get(e, &"name".into()).ok().and_then(|n| n.as_string())
+}
+
+/// Like [`err`], but prefixed with the DOMException name (`QuotaExceededError: ...`)
+/// so a storage failure says *what* failed, not just its message.
+fn err_named(e: &JsValue) -> String {
+    match dom_name(e) {
+        Some(name) => format!("{name}: {}", err(e.clone())),
+        None => err(e.clone()),
+    }
 }
 
 /// Did an OPFS call fail because the entry doesn't exist (`NotFoundError`)? Any other failure
@@ -95,42 +111,127 @@ async fn idb_done(tx: &web_sys::IdbTransaction) -> Result<(), String> {
     JsFuture::from(p).await.map(|_| ()).map_err(err)
 }
 
+/// Outcome of the persistent-storage request, recorded for the UI to read via
+/// [`Backend::persistence_status`]: 0 unknown (not yet answered), 1 granted,
+/// 2 not granted (storage stays evictable), 3 unavailable (no storage manager
+/// or the request itself failed). Written once by the detached persistence
+/// task; read-only afterwards.
+static PERSISTENCE: AtomicU8 = AtomicU8::new(0);
+
 /// Ask the browser not to evict our storage under pressure, best effort: a missing
 /// storage manager, a rejected request, or a refusal all leave storage usable, they
 /// only leave it evictable. Mirrors the desktop web app's `request_persistence`.
+/// Records its outcome in [`PERSISTENCE`] and logs it; never returns an error.
 async fn request_persistence() {
-    let Some(sm) = storage_manager() else { return };
+    let Some(sm) = storage_manager() else {
+        PERSISTENCE.store(3, Ordering::Relaxed);
+        return;
+    };
     let already = match sm.persisted() {
         Ok(p) => JsFuture::from(p).await.ok().is_some_and(|v| v.is_truthy()),
         Err(_) => false,
     };
     if already {
+        PERSISTENCE.store(1, Ordering::Relaxed);
         return;
     }
     match sm.persist() {
         Ok(p) => {
             let granted = JsFuture::from(p).await.ok().is_some_and(|v| v.is_truthy());
+            PERSISTENCE.store(if granted { 1 } else { 2 }, Ordering::Relaxed);
             log::info!("lightcraft-mobile: persistent storage {}", if granted { "granted" } else { "not granted" });
         }
-        Err(_) => {}
+        Err(_) => {
+            PERSISTENCE.store(3, Ordering::Relaxed);
+        }
     }
 }
 
 impl Backend {
-    /// OPFS if writable from here, else IndexedDB. Persistence is requested first, so
-    /// the library and saved versions are less likely to be evicted under storage
-    /// pressure; the request never fails opening.
+    /// The persistent-storage request outcome, for the UI: "unknown" (not yet
+    /// answered), "granted", "not granted" (storage stays evictable), or
+    /// "unavailable". The request runs detached from opening (see [`Backend::open`]),
+    /// so this starts as "unknown" and settles later; it is a status, never a gate.
+    pub fn persistence_status() -> &'static str {
+        match PERSISTENCE.load(Ordering::Relaxed) {
+            1 => "granted",
+            2 => "not granted",
+            3 => "unavailable",
+            _ => "unknown",
+        }
+    }
+
+    /// OPFS if writable from here, else IndexedDB. The persistent-storage request
+    /// runs detached in the background and never blocks opening: a hung
+    /// `persist()` promise must not stall startup into the host's open watchdog.
+    /// A failed `get_directory()` is an error, not a silent fallback: when OPFS
+    /// was expected to work, falling back would present a different, empty
+    /// IndexedDB library and strand saves in the other store. IndexedDB is
+    /// used only when OPFS is affirmatively unsupported here (no writable
+    /// OPFS API, or no storage manager to ask for a directory).
     pub async fn open() -> Result<Backend, String> {
-        request_persistence().await;
-        if opfs_writable()
-            && let Some(sm) = storage_manager()
-        {
-            match JsFuture::from(sm.get_directory()).await {
-                Ok(root) => return Ok(Backend::Opfs(root.unchecked_into())),
-                Err(e) => log::warn!("OPFS unavailable ({}); using IndexedDB", err(e)),
+        // Detached: `Backend::open` is always awaited inside a spawned task
+        // (the host's storage worker), which is the context `spawn_local`
+        // needs. The task records its outcome in `PERSISTENCE`.
+        wasm_bindgen_futures::spawn_local(async {
+            request_persistence().await;
+        });
+        if opfs_writable() {
+            if let Some(sm) = storage_manager() {
+                return match JsFuture::from(sm.get_directory()).await {
+                    Ok(root) => Ok(Backend::Opfs(root.unchecked_into())),
+                    Err(e) => Err(format!("OPFS unavailable: {}", err_named(&e))),
+                };
             }
         }
         Self::open_idb().await
+    }
+
+    /// Resolve an IndexedDB *open* request: success, a distinct message when the
+    /// stored database is from a newer version, an `onblocked` log while
+    /// another connection holds the database, and a 10-second timeout so a
+    /// stalled open can never hang startup forever. The timeout only rejects
+    /// the still-pending promise; a later success is a harmless no-op.
+    async fn idb_open(req: &web_sys::IdbOpenDbRequest) -> Result<JsValue, String> {
+        let r1 = req.clone();
+        let p = js_sys::Promise::new(&mut |resolve, reject| {
+            let r2 = r1.clone();
+            let ok = Closure::once_into_js(move || {
+                let _ = resolve.call1(&JsValue::NULL, &r2.result().unwrap_or(JsValue::UNDEFINED));
+            });
+            let r3 = r1.clone();
+            let rej_fail = reject.clone();
+            let fail = Closure::once_into_js(move |_event: JsValue| {
+                // `IDBRequest.error` has no typed binding in this web-sys
+                // version, so read the property through Reflect, the same
+                // way `dom_name` reads `name`.
+                let err_value = Reflect::get(r3.as_ref(), &JsValue::from_str("error"))
+                    .ok()
+                    .filter(|v| !v.is_null() && !v.is_undefined());
+                let reason = match err_value.as_ref() {
+                    Some(v) if dom_name(v).as_deref() == Some("VersionError") => {
+                        "stored IndexedDB database is from a newer version (VersionError); close other copies of the app and retry".to_string()
+                    }
+                    Some(v) => err_named(v),
+                    None => "IndexedDB open failed".to_string(),
+                };
+                let _ = rej_fail.call1(&JsValue::NULL, &JsValue::from_str(&reason));
+            });
+            let blocked = Closure::once_into_js(move || {
+                log::warn!("lightcraft-mobile: IndexedDB open blocked by another connection; waiting for it to close");
+            });
+            r1.set_onsuccess(Some(ok.unchecked_ref()));
+            r1.set_onerror(Some(fail.unchecked_ref()));
+            r1.set_onblocked(Some(blocked.unchecked_ref()));
+            if let Some(window) = web_sys::window() {
+                let rej_timeout = reject.clone();
+                let timeout = Closure::once_into_js(move || {
+                    let _ = rej_timeout.call1(&JsValue::NULL, &JsValue::from_str("IndexedDB open timed out after 10 seconds"));
+                });
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(timeout.unchecked_ref(), 10_000);
+            }
+        });
+        JsFuture::from(p).await.map_err(err)
     }
 
     async fn open_idb() -> Result<Backend, String> {
@@ -145,9 +246,20 @@ impl Backend {
             }
         });
         req.set_onupgradeneeded(Some(upgrade.as_ref().unchecked_ref()));
-        let db = idb_req(&req).await?;
+        let db_value = Self::idb_open(&req).await?;
         drop(upgrade);
-        Ok(Backend::Idb(db.unchecked_into()))
+        let db: IdbDatabase = db_value.unchecked_into();
+        // If another context upgrades the database, this connection must close
+        // instead of holding the old version open and blocking the upgrade.
+        // One closure per open, kept alive for the life of the connection.
+        let db_for_close = db.clone();
+        let on_version_change = Closure::<dyn FnMut(web_sys::IdbVersionChangeEvent)>::new(move |_e: web_sys::IdbVersionChangeEvent| {
+            log::warn!("lightcraft-mobile: IndexedDB version change from another context; closing this connection");
+            db_for_close.close();
+        });
+        db.set_onversionchange(Some(on_version_change.as_ref().unchecked_ref()));
+        on_version_change.forget();
+        Ok(Backend::Idb(db))
     }
 
     /// "opfs" or "idb".
@@ -226,15 +338,27 @@ impl Backend {
             Backend::Opfs(root) => {
                 let h = Self::opfs_file(root, path, true).await?.ok_or("can't create file")?;
                 let opts = web_sys::FileSystemCreateWritableOptions::new();
+                // Replace, never append to or keep a longer previous file:
+                // without this an over-write that shrinks the file would leave
+                // stale trailing bytes behind the new content.
+                opts.set_keep_existing_data(false);
                 let w: web_sys::FileSystemWritableFileStream =
-                    JsFuture::from(h.create_writable_with_options(&opts)).await.map_err(err)?.unchecked_into();
-                let res = async { JsFuture::from(w.write_with_js_u8_array(&Uint8Array::from(data)).map_err(err)?).await.map_err(err) }.await;
-                match res {
-                    Ok(_) => JsFuture::from(w.close()).await.map(|_| ()).map_err(err),
-                    Err(e) => {
-                        let _ = JsFuture::from(w.abort()).await;
-                        Err(e)
-                    }
+                    JsFuture::from(h.create_writable_with_options(&opts)).await.map_err(|e| err_named(&e))?.unchecked_into();
+                let result = async {
+                    JsFuture::from(w.seek_with_f64(0.0).map_err(|e| err_named(&e))?).await.map_err(|e| err_named(&e))?;
+                    JsFuture::from(w.truncate_with_f64(0.0).map_err(|e| err_named(&e))?).await.map_err(|e| err_named(&e))?;
+                    JsFuture::from(w.write_with_js_u8_array(&Uint8Array::from(data)).map_err(|e| err_named(&e))?).await.map_err(|e| err_named(&e))?;
+                    JsFuture::from(w.close()).await.map_err(|e| err_named(&e))?;
+                    Ok::<(), String>(())
+                }
+                .await;
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(e) => match JsFuture::from(w.abort()).await {
+                        // The swap file is discarded; the previous file stays intact.
+                        Ok(_) => Err(e),
+                        Err(abort_err) => Err(format!("{e}; abort failed: {}", err_named(&abort_err))),
+                    },
                 }
             }
             Backend::Idb(db) => {

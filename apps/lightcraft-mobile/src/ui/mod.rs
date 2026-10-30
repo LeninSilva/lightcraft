@@ -183,6 +183,17 @@ pub struct App {
     gesture_key: Option<String>,
     /// The "hold for original" button was held on the previous frame.
     holding_compare: bool,
+    /// Compare is latched on by a quick tap of the Compare button; a
+    /// press-and-hold compares only while held and never changes this.
+    compare_latched: bool,
+    /// When the current Compare press started, in host milliseconds, so a
+    /// quick tap can be told apart from a hold. `None` when not pressed.
+    compare_press_ms: Option<f64>,
+    /// Thumbnail regenerations waiting on a source blob: source blob key
+    /// to the thumbnail key and recipe to render it with. A missing or
+    /// corrupt stored thumbnail is regenerated from the original or
+    /// version blob instead of showing "No preview" forever.
+    thumb_regen: HashMap<String, (String, Recipe)>,
     preview: Option<Preview>,
     /// Thumbnail textures by storage key, with their pixel size.
     thumbs: HashMap<String, (TextureHandle, [usize; 2])>,
@@ -236,6 +247,9 @@ impl App {
             dragging: false,
             gesture_key: None,
             holding_compare: false,
+            compare_latched: false,
+            compare_press_ms: None,
+            thumb_regen: HashMap::new(),
             preview: None,
             thumbs: HashMap::new(),
             look_thumbs: HashMap::new(),
@@ -548,6 +562,31 @@ impl App {
                 return;
             }
         }
+        // A source blob that arrived for a thumbnail regeneration: render
+        // the thumbnail from it and store it, instead of dropping it as a
+        // superseded load. A pending open or export above owns the same
+        // blob first, so a regeneration requested while one is in flight
+        // simply waits for the next library load.
+        if let Some((thumb_key_str, recipe)) = self.thumb_regen.remove(&key) {
+            let Some(bytes) = bytes else { return };
+            let still_there = if let Some(id_str) = thumb_key_str.strip_prefix("library/thumb/") {
+                id_str.parse::<u64>().is_ok_and(|id| self.library.photo(id).is_some())
+            } else if let Some(id_str) = thumb_key_str.strip_prefix("library/version-thumb/") {
+                id_str.parse::<u64>().is_ok_and(|id| self.library.version(id).is_some())
+            } else {
+                false
+            };
+            if !still_there {
+                return;
+            }
+            let Ok(photo) = Photo::open(&bytes) else { return };
+            let analysis = crate::analysis::analyze(&photo.proxy);
+            if let Some(thumb) = self.render_thumb_jpeg(&photo, &analysis, &recipe) {
+                self.pending_thumbs.push((thumb_key_str.clone(), thumb.clone()));
+                self.host.send(HostRequest::Put { key: thumb_key_str, bytes: thumb });
+            }
+            return;
+        }
         // Anything else that arrived is a thumbnail blob. A load blob
         // whose key no longer matches a pending slot is a superseded
         // answer (a second tap overwrote the slot): it is ignored here,
@@ -557,6 +596,10 @@ impl App {
         }
         if let Some(b) = bytes {
             self.pending_thumbs.push((key, b));
+        } else {
+            // A stored thumbnail that is missing is regenerated from the
+            // source blob instead of leaving "No preview" up forever.
+            self.request_thumb_regen(&key);
         }
     }
 
@@ -682,8 +725,7 @@ impl App {
             .photo(id)
             .map(|e| e.name.clone())
             .unwrap_or_else(|| name.clone());
-        self.open_entry(Some(id), None, id, display_name.clone(), bytes, photo, Recipe::default());
-        self.set_status(format!("Opened {display_name}."), false);
+        self.open_entry(Some(id), None, id, display_name, bytes, photo, Recipe::default());
     }
 
     fn open_entry(
@@ -703,6 +745,7 @@ impl App {
             self.library.set_recipe(id, &recipe);
             self.save_library();
         }
+        let status_name = name.clone();
         self.current = Some(OpenPhoto {
             entry_id,
             version_id,
@@ -720,6 +763,12 @@ impl App {
         self.look_thumbs.clear();
         self.look_thumbs_for = String::new();
         self.screen = Screen::Editor;
+        // Entering the editor disarms a two-step delete armed in the grid:
+        // returning later must not delete on one tap.
+        self.armed_remove = None;
+        // A pending open that reached here succeeded; say so, instead of
+        // leaving the "Opening photo." status up for the whole edit.
+        self.set_status(format!("Opened {status_name}."), false);
     }
 
     /// Store the open entry's current recipe back into the library entry
@@ -744,8 +793,67 @@ impl App {
         }
     }
 
+    /// Re-render the open entry's stored thumbnail with the recipe just
+    /// stored in the library, and queue it for display and storage, so
+    /// the grid shows the edited image instead of the pre-edit one.
+    /// No-op when nothing is open or the entry has since been removed.
+    /// Called after `store_current_recipe` in `leave_editor` and the
+    /// `request_open_*` paths, which are the points where edits are
+    /// stored; it is not called on every slider frame.
+    fn refresh_stored_thumb(&mut self) {
+        let (photo, analysis, key, recipe) = match &self.current {
+            Some(c) => {
+                let (key, recipe) = match (c.entry_id, c.version_id) {
+                    (Some(id), _) => match self.library.photo(id) {
+                        Some(e) => (thumb_key(id), e.recipe.clone()),
+                        None => return,
+                    },
+                    (None, Some(id)) => match self.library.version(id) {
+                        Some(v) => (version_thumb_key(id), v.recipe.clone()),
+                        None => return,
+                    },
+                    (None, None) => return,
+                };
+                (c.photo.clone(), c.analysis.clone(), key, recipe)
+            }
+            None => return,
+        };
+        if let Some(thumb) = self.render_thumb_jpeg(&photo, &analysis, &recipe) {
+            self.pending_thumbs.push((key.clone(), thumb.clone()));
+            self.host.send(HostRequest::Put { key, bytes: thumb });
+        }
+    }
+
+    /// Ask for the source blob a missing or corrupt stored thumbnail can
+    /// be regenerated from. `thumb_key_str` is a `library/thumb/{id}` or
+    /// `library/version-thumb/{id}` key. No-op for any other key, for an
+    /// entry that no longer exists, or when a regeneration is already
+    /// waiting on that source blob, so a bad thumbnail can never loop.
+    fn request_thumb_regen(&mut self, thumb_key_str: &str) {
+        let (source_key, recipe) = if let Some(id_str) = thumb_key_str.strip_prefix("library/thumb/") {
+            let Ok(id) = id_str.parse::<u64>() else { return };
+            let Some(entry) = self.library.photo(id) else { return };
+            (original_key(id), entry.recipe.clone())
+        } else if let Some(id_str) = thumb_key_str.strip_prefix("library/version-thumb/") {
+            let Ok(id) = id_str.parse::<u64>() else { return };
+            let Some(version) = self.library.version(id) else { return };
+            (version_key(id), version.recipe.clone())
+        } else {
+            return;
+        };
+        if self.thumb_regen.contains_key(&source_key) {
+            return;
+        }
+        self.thumb_regen.insert(source_key.clone(), (thumb_key_str.to_string(), recipe));
+        self.host.send(HostRequest::Get { key: source_key });
+    }
+
     fn leave_editor(&mut self) {
         self.store_current_recipe();
+        self.refresh_stored_thumb();
+        // Leaving the editor disarms a two-step delete armed in the grid:
+        // returning later must not delete on one tap.
+        self.armed_remove = None;
         self.dirty_library = true;
         self.screen = Screen::Library;
     }
@@ -758,6 +866,7 @@ impl App {
         // Leaving an open photo or version first stores its recipe in the
         // library, so edits to a saved version are not lost either.
         self.store_current_recipe();
+        self.refresh_stored_thumb();
         self.save_library();
         self.pending_open = Some(PendingOpen::Photo(id));
         self.host.send(HostRequest::Get { key: original_key(id) });
@@ -772,6 +881,7 @@ impl App {
         // Leaving an open photo or version first stores its recipe in the
         // library, as opening another photo does.
         self.store_current_recipe();
+        self.refresh_stored_thumb();
         self.save_library();
         self.pending_open = Some(PendingOpen::Version(id));
         self.host.send(HostRequest::Get { key: version_key(id) });
@@ -857,10 +967,19 @@ impl App {
     }
 
     /// Record the recipe as it is now, apply a change, and seal the step.
+    /// A change that leaves the recipe identical (re-picking the current
+    /// aspect, resetting an already default group, re-applying an
+    /// already applied tip) records nothing: `History::record` would
+    /// push a no-op step and clear the redo stack for it.
     fn edit_recipe(&mut self, key: &str, apply: impl FnOnce(&mut Recipe)) {
         let before = self.recipe.clone();
+        let mut next = before.clone();
+        apply(&mut next);
+        if next == before {
+            return;
+        }
         self.history.record(&before, key);
-        apply(&mut self.recipe);
+        self.recipe = next;
         self.history.seal();
         self.gesture_key = None;
         self.dirty_library = true;
@@ -1164,13 +1283,20 @@ impl App {
             // live from the original here.
             let photo = match Photo::open(&bytes) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(_) => {
+                    // A stored thumbnail that cannot be decoded is
+                    // regenerated from the source blob instead of being
+                    // silently dropped, which left "No preview" up.
+                    self.request_thumb_regen(&key);
+                    continue;
+                }
             };
             let preview = &photo.preview;
             if preview.width == 0
                 || preview.height == 0
                 || preview.data.len() != preview.width * preview.height
             {
+                self.request_thumb_regen(&key);
                 continue;
             }
             let matrix = REC2020.to_space(&SRGB);
@@ -1434,17 +1560,26 @@ impl App {
             {
                 self.leave_editor();
             }
-            let name_w = (top_w - MIN_TOUCH - 104.0 - 16.0).max(40.0);
+            // Library 44 + gap 8 + Undo 44 + gap 8 + Redo 44 + gap 8:
+            // the horizontal layout inserts 8pt between each widget, so
+            // the name gets exactly what is left.
+            let name_w = (top_w - MIN_TOUCH - 8.0 - MIN_TOUCH - 8.0 - MIN_TOUCH - 8.0).max(40.0);
             ui.add_sized(
                 egui::vec2(name_w, MIN_TOUCH),
                 egui::Label::new(egui::RichText::new(name.as_str()).size(16.0)).truncate(),
             );
             let can_undo = self.can_undo();
-            if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+            let undo_resp = ui.add_enabled_ui(can_undo, |ui| {
+                ui.add_sized(egui::vec2(MIN_TOUCH, MIN_TOUCH), egui::Button::new("Undo"))
+            });
+            if undo_resp.inner.clicked() {
                 self.undo();
             }
             let can_redo = self.can_redo();
-            if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+            let redo_resp = ui.add_enabled_ui(can_redo, |ui| {
+                ui.add_sized(egui::vec2(MIN_TOUCH, MIN_TOUCH), egui::Button::new("Redo"))
+            });
+            if redo_resp.inner.clicked() {
                 self.redo();
             }
         });
@@ -1477,16 +1612,40 @@ impl App {
             }
             let resp = ui.add_sized(
                 egui::vec2(button_w, MIN_TOUCH),
-                egui::Button::new("Hold: original"),
+                egui::Button::new("Compare").selected(self.compare_latched),
             );
-            holding = resp.is_pointer_button_down_on();
+            let pressed = resp.is_pointer_button_down_on();
+            if pressed && self.compare_press_ms.is_none() {
+                self.compare_press_ms = Some(self.host.now_ms());
+            }
+            if resp.clicked() {
+                // A quick tap latches compare on or off; a hold (300ms or
+                // more) compares only while held and leaves the latch
+                // alone, so releasing a hold never sticks compare on.
+                let elapsed = self.compare_press_ms.map(|start| self.host.now_ms() - start);
+                if elapsed.is_none_or(|ms| ms < 300.0) {
+                    self.compare_latched = !self.compare_latched;
+                }
+            }
+            if !pressed {
+                self.compare_press_ms = None;
+            }
+            holding = pressed || self.compare_latched;
         });
         ui.label("Save version keeps a full resolution JPEG in the app. Export saves a copy in the app cache; use Share to move it out to Photos or Files.");
         status_label(ui, self);
-        // Photo area, tab bar and panel share what is left.
+        // Photo area, tab bar and panel share what is left. The panel is
+        // 40% of the height (clamped 120..340pt), and it never takes so
+        // much that less than 120pt is left for the photo after the top
+        // bar, action row, tab bar and spacing (`reserved`): that guard
+        // is what keeps the photo out of an 80pt sliver in landscape.
+        // Portrait 390x844: panel 337.6, photo 346.4. Landscape 844x390:
+        // panel 120, photo 110. (`reserved` still undercounts the label
+        // rows above the photo; the panel is scrollable, so any spill
+        // there clips inside the panel, not the photo.)
         let avail = ui.available_size();
         let reserved = MIN_TOUCH + MIN_TOUCH + TAB_BAR_HEIGHT + 24.0;
-        let panel_h = (avail.y - reserved - 120.0).clamp(180.0, 340.0);
+        let panel_h = (avail.y * 0.40).clamp(120.0, 340.0).min((avail.y - reserved - 120.0).max(120.0));
         let photo_h = (avail.y - reserved - panel_h).max(80.0);
         let preview = self.ensure_preview(&ctx, egui::vec2(avail.x, photo_h));
         ui.allocate_ui(egui::vec2(avail.x, photo_h), |ui| match preview {
@@ -1557,7 +1716,7 @@ impl App {
         let auto = self.recipe.auto;
         self.float_slider(
             ui,
-            SliderSpec { label: "Auto strength", min: 0.0, max: 100.0, step: 1.0, key: "auto", reset_to: None },
+            SliderSpec { label: "Auto strength", min: 0.0, max: 100.0, step: 1.0, key: "auto", reset_to: Some(0.0) },
             auto,
             any_dragged,
             |r, v| r.auto = v,
@@ -1618,18 +1777,27 @@ impl App {
                     max: 100.0,
                     step: 1.0,
                     key: "look_strength",
-                    reset_to: None,
+                    reset_to: Some(100.0),
                 },
                 strength,
                 any_dragged,
                 |r, v| r.look_strength = v,
             );
         } else {
+            // Same row geometry as an enabled `float_slider` row (104pt
+            // label, full-width 44pt slider), so the panel does not jump
+            // when a look is picked.
             let mut value = self.recipe.look_strength;
-            ui.add_enabled(
-                false,
-                egui::Slider::new(&mut value, 0.0..=100.0).text("Look strength"),
-            );
+            ui.horizontal(|ui| {
+                ui.add_sized(egui::vec2(104.0, MIN_TOUCH), egui::Label::new("Look strength"));
+                let slider_w = ui.available_width().max(60.0);
+                ui.add_enabled_ui(false, |ui| {
+                    ui.add_sized(
+                        egui::vec2(slider_w, MIN_TOUCH),
+                        egui::Slider::new(&mut value, 0.0..=100.0),
+                    )
+                });
+            });
             ui.label("Pick a look first, then set its strength.");
         }
         ui.label("Look strength blends the selected look over the Auto result. Thumbnails show each look at full strength; the preview uses the Look strength above.");
@@ -1652,19 +1820,28 @@ impl App {
         for found in LOOKS {
             let thumb = self.ensure_look_thumb(&ctx, found.id);
             let is_current = current_look.as_deref() == Some(found.id);
-            ui.allocate_ui(egui::vec2(ui.available_width(), 150.0), |ui| match thumb {
-                Some((id, size)) => {
-                    let fit = fit_size(egui::vec2(ui.available_width(), 84.0), size);
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new((id, fit)));
-                    });
-                }
-                None => {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("No preview");
-                    });
-                }
-            });
+            // Tapping a look's thumbnail picks the look, like its Use button.
+            let thumb_clicked = ui
+                .allocate_ui(egui::vec2(ui.available_width(), 150.0), |ui| match thumb {
+                    Some((id, size)) => {
+                        let fit = fit_size(egui::vec2(ui.available_width(), 84.0), size);
+                        ui.centered_and_justified(|ui| {
+                            ui.add(egui::Image::new((id, fit)).sense(egui::Sense::click()))
+                        })
+                        .inner
+                        .clicked()
+                    }
+                    None => {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("No preview");
+                        });
+                        false
+                    }
+                })
+                .inner;
+            if thumb_clicked {
+                chosen = Some(Some(found.id.to_string()));
+            }
             ui.label(egui::RichText::new(found.name).strong());
             ui.label(found.blurb);
             if ui
@@ -1792,11 +1969,19 @@ impl App {
                 |r, v| r.focus.background = v,
             );
         } else {
+            // Same row geometry as an enabled `float_slider` row, so the
+            // panel does not jump when Focus is turned on.
             let mut value = self.recipe.focus.background;
-            ui.add_enabled(
-                false,
-                egui::Slider::new(&mut value, 0.0..=100.0).text("Background"),
-            );
+            ui.horizontal(|ui| {
+                ui.add_sized(egui::vec2(104.0, MIN_TOUCH), egui::Label::new("Background"));
+                let slider_w = ui.available_width().max(60.0);
+                ui.add_enabled_ui(false, |ui| {
+                    ui.add_sized(
+                        egui::vec2(slider_w, MIN_TOUCH),
+                        egui::Slider::new(&mut value, 0.0..=100.0),
+                    )
+                });
+            });
             ui.label("Turn Focus on first, then set how much the background is quieted.");
         }
         ui.label("Focus uses the detected subject. Tap to place the subject is not in this build.");
@@ -1967,6 +2152,18 @@ impl App {
     }
 }
 
+/// Grid columns for a width, guaranteeing 44pt buttons. Three buttons
+/// in one row need 3*44 + 2*8 (gaps) = 148pt of tile width; when a tile
+/// is narrower the buttons fall back to two rows (second value true).
+/// Narrow phones get 2 columns, wider ones 4: at 390pt the old
+/// `/130.0` rule gave 3 columns and 38.9pt buttons.
+fn grid_layout(avail_w: f32) -> (usize, bool) {
+    let cols = if avail_w < 560.0 { 2 } else { 4 };
+    let tile_w = (avail_w - (cols as f32 - 1.0) * 8.0) / cols as f32;
+    let one_row = (tile_w - 16.0) / 3.0 >= MIN_TOUCH;
+    (cols, !one_row)
+}
+
 fn draw_photo_grid(
     ui: &mut egui::Ui,
     tiles: &[(EntryView, Option<(egui::TextureId, [usize; 2])>)],
@@ -1974,46 +2171,82 @@ fn draw_photo_grid(
     actions: &mut Vec<GridAction>,
 ) {
     let avail_w = ui.available_width();
-    let cols = ((avail_w / 130.0) as usize).clamp(2, 4);
+    let (cols, two_rows) = grid_layout(avail_w);
     let tile_w = (avail_w - (cols as f32 - 1.0) * 8.0) / cols as f32;
-    let tile_h = tile_w * 0.75 + 100.0;
+    let tile_h = tile_w * 0.75 + if two_rows { 152.0 } else { 100.0 };
     for row in tiles.chunks(cols) {
         ui.horizontal(|ui| {
             for (view, tex) in row {
                 ui.allocate_ui(egui::vec2(tile_w, tile_h), |ui| {
-                    draw_tile_image(ui, tile_w, *tex);
+                    if draw_tile_image(ui, tile_w, *tex) {
+                        actions.push(GridAction::OpenPhoto(view.id));
+                    }
                     ui.add(egui::Label::new(view.name.as_str()).truncate());
                     ui.label(egui::RichText::new(format!("{} by {}", view.width, view.height)).small());
-                    let bw = (tile_w - 8.0) / 3.0;
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_sized(egui::vec2(bw, MIN_TOUCH), egui::Button::new("Open"))
-                            .clicked()
-                        {
-                            actions.push(GridAction::OpenPhoto(view.id));
-                        }
-                        let keep_label = if view.kept { "Kept" } else { "Keep" };
-                        if ui
-                            .add_sized(
-                                egui::vec2(bw, MIN_TOUCH),
-                                egui::Button::new(keep_label).selected(view.kept),
-                            )
-                            .clicked()
-                        {
-                            actions.push(GridAction::ToggleKeep(view.id));
-                        }
-                        let armed_here = armed == Some(RemovalTarget::Photo(view.id));
-                        let remove_label = if armed_here { "Sure?" } else { "Remove" };
-                        if ui
-                            .add_sized(
-                                egui::vec2(bw, MIN_TOUCH),
-                                egui::Button::new(remove_label).selected(armed_here),
-                            )
-                            .clicked()
-                        {
-                            actions.push(GridAction::RemovePhoto(view.id));
-                        }
-                    });
+                    // Buttons are at least 44pt wide: one row of three
+                    // when the tile fits them, else two rows.
+                    let bw = ((tile_w - 16.0) / 3.0).max(MIN_TOUCH);
+                    let bw2 = ((tile_w - 8.0) / 2.0).max(MIN_TOUCH);
+                    let keep_label = if view.kept { "Kept" } else { "Keep" };
+                    let armed_here = armed == Some(RemovalTarget::Photo(view.id));
+                    let remove_label = if armed_here { "Sure?" } else { "Remove" };
+                    if two_rows {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(egui::vec2(bw2, MIN_TOUCH), egui::Button::new("Open"))
+                                .clicked()
+                            {
+                                actions.push(GridAction::OpenPhoto(view.id));
+                            }
+                            if ui
+                                .add_sized(
+                                    egui::vec2(bw2, MIN_TOUCH),
+                                    egui::Button::new(keep_label).selected(view.kept),
+                                )
+                                .clicked()
+                            {
+                                actions.push(GridAction::ToggleKeep(view.id));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(
+                                    egui::vec2(tile_w, MIN_TOUCH),
+                                    egui::Button::new(remove_label).selected(armed_here),
+                                )
+                                .clicked()
+                            {
+                                actions.push(GridAction::RemovePhoto(view.id));
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(egui::vec2(bw, MIN_TOUCH), egui::Button::new("Open"))
+                                .clicked()
+                            {
+                                actions.push(GridAction::OpenPhoto(view.id));
+                            }
+                            if ui
+                                .add_sized(
+                                    egui::vec2(bw, MIN_TOUCH),
+                                    egui::Button::new(keep_label).selected(view.kept),
+                                )
+                                .clicked()
+                            {
+                                actions.push(GridAction::ToggleKeep(view.id));
+                            }
+                            if ui
+                                .add_sized(
+                                    egui::vec2(bw, MIN_TOUCH),
+                                    egui::Button::new(remove_label).selected(armed_here),
+                                )
+                                .clicked()
+                            {
+                                actions.push(GridAction::RemovePhoto(view.id));
+                            }
+                        });
+                    }
                 });
             }
         });
@@ -2027,63 +2260,98 @@ fn draw_version_grid(
     actions: &mut Vec<GridAction>,
 ) {
     let avail_w = ui.available_width();
-    let cols = ((avail_w / 130.0) as usize).clamp(2, 4);
+    let (cols, two_rows) = grid_layout(avail_w);
     let tile_w = (avail_w - (cols as f32 - 1.0) * 8.0) / cols as f32;
-    let tile_h = tile_w * 0.75 + 100.0;
+    let tile_h = tile_w * 0.75 + if two_rows { 152.0 } else { 100.0 };
     for row in tiles.chunks(cols) {
         ui.horizontal(|ui| {
             for (view, tex) in row {
                 ui.allocate_ui(egui::vec2(tile_w, tile_h), |ui| {
-                    draw_tile_image(ui, tile_w, *tex);
+                    if draw_tile_image(ui, tile_w, *tex) {
+                        actions.push(GridAction::OpenVersion(view.id));
+                    }
                     ui.add(egui::Label::new(view.name.as_str()).truncate());
                     ui.label(egui::RichText::new(format!("{} by {}", view.width, view.height)).small());
-                    let bw = (tile_w - 8.0) / 3.0;
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_sized(egui::vec2(bw, MIN_TOUCH), egui::Button::new("Open"))
-                            .clicked()
-                        {
-                            actions.push(GridAction::OpenVersion(view.id));
-                        }
-                        if ui
-                            .add_sized(egui::vec2(bw, MIN_TOUCH), egui::Button::new("Export"))
-                            .clicked()
-                        {
-                            actions.push(GridAction::ExportVersion(view.id));
-                        }
-                        let armed_here = armed == Some(RemovalTarget::Version(view.id));
-                        let delete_label = if armed_here { "Sure?" } else { "Delete" };
-                        if ui
-                            .add_sized(
-                                egui::vec2(bw, MIN_TOUCH),
-                                egui::Button::new(delete_label).selected(armed_here),
-                            )
-                            .clicked()
-                        {
-                            actions.push(GridAction::DeleteVersion(view.id));
-                        }
-                    });
+                    let bw = ((tile_w - 16.0) / 3.0).max(MIN_TOUCH);
+                    let bw2 = ((tile_w - 8.0) / 2.0).max(MIN_TOUCH);
+                    let armed_here = armed == Some(RemovalTarget::Version(view.id));
+                    let delete_label = if armed_here { "Sure?" } else { "Delete" };
+                    if two_rows {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(egui::vec2(bw2, MIN_TOUCH), egui::Button::new("Open"))
+                                .clicked()
+                            {
+                                actions.push(GridAction::OpenVersion(view.id));
+                            }
+                            if ui
+                                .add_sized(egui::vec2(bw2, MIN_TOUCH), egui::Button::new("Export"))
+                                .clicked()
+                            {
+                                actions.push(GridAction::ExportVersion(view.id));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(
+                                    egui::vec2(tile_w, MIN_TOUCH),
+                                    egui::Button::new(delete_label).selected(armed_here),
+                                )
+                                .clicked()
+                            {
+                                actions.push(GridAction::DeleteVersion(view.id));
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(egui::vec2(bw, MIN_TOUCH), egui::Button::new("Open"))
+                                .clicked()
+                            {
+                                actions.push(GridAction::OpenVersion(view.id));
+                            }
+                            if ui
+                                .add_sized(egui::vec2(bw, MIN_TOUCH), egui::Button::new("Export"))
+                                .clicked()
+                            {
+                                actions.push(GridAction::ExportVersion(view.id));
+                            }
+                            if ui
+                                .add_sized(
+                                    egui::vec2(bw, MIN_TOUCH),
+                                    egui::Button::new(delete_label).selected(armed_here),
+                                )
+                                .clicked()
+                            {
+                                actions.push(GridAction::DeleteVersion(view.id));
+                            }
+                        });
+                    }
                 });
             }
         });
     }
 }
 
-fn draw_tile_image(ui: &mut egui::Ui, width: f32, tex: Option<(egui::TextureId, [usize; 2])>) {
+/// Draw one tile image, clickable: tapping it opens the photo or saved
+/// version, like the Open button. Returns whether it was clicked.
+fn draw_tile_image(ui: &mut egui::Ui, width: f32, tex: Option<(egui::TextureId, [usize; 2])>) -> bool {
     let height = width * 0.75;
     ui.allocate_ui(egui::vec2(width, height), |ui| match tex {
         Some((id, size)) => {
             let fit = fit_size(ui.available_size(), size);
-            ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new((id, fit)));
-            });
+            ui.centered_and_justified(|ui| ui.add(egui::Image::new((id, fit)).sense(egui::Sense::click())))
+                .inner
+                .clicked()
         }
         None => {
             ui.centered_and_justified(|ui| {
                 ui.label("No preview");
             });
+            false
         }
-    });
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -2402,10 +2670,11 @@ mod tests {
     #[test]
     fn stored_index_round_trips_through_loaded_events() {
         let (mut app, state) = app_with_test_host();
-        // Let the startup index load answer arrive first: until the library
-        // has loaded, index writes are deliberately held back.
-        run_frames(&egui::Context::default(), &mut app, 1);
-        assert!(app.library_loaded);
+        // Let the startup index load answer arrive (no stored index yet)
+        // before opening a photo: index writes are held back until the
+        // library has loaded, so the stored index would otherwise be empty.
+        let ctx = egui::Context::default();
+        run_frames(&ctx, &mut app, 1);
         open_scene(&mut app);
         app.toggle_keep(app.library.photos[0].id);
         // A fresh app reading the stored index sees the same library.
