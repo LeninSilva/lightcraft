@@ -30,7 +30,10 @@ const WEB_PROFILE: &str = "web";
 const SITE_DIR: &str = "mobile-site";
 
 /// Files copied from `apps/lightcraft-mobile/` into the bundle as they are.
-const STATIC_FILES: [&str; 1] = ["index.html"];
+const STATIC_FILES: [&str; 3] = ["index.html", "manifest.webmanifest", "sw.js"];
+
+/// Icon files copied from `apps/lightcraft-mobile/icons/` into `icons/` in the bundle.
+const ICON_FILES: [&str; 3] = ["icon-192.png", "icon-512.png", "apple-touch-icon.png"];
 
 /// Bundle files that get precompressed copies.
 const COMPRESSED: [&str; 3] = ["index.html", "lightcraft_mobile.js", "lightcraft_mobile_bg.wasm"];
@@ -136,6 +139,13 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     for f in STATIC_FILES {
         std::fs::copy(root().join("apps/lightcraft-mobile").join(f), out.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
     }
+    // PWA icons live in a subdirectory, which the flat copy above cannot carry.
+    let icons_out = out.join("icons");
+    std::fs::create_dir_all(&icons_out).map_err(|e| format!("mkdir icons: {e}"))?;
+    for f in ICON_FILES {
+        std::fs::copy(root().join("apps/lightcraft-mobile/icons").join(f), icons_out.join(f))
+            .map_err(|e| format!("copy icons/{f}: {e}"))?;
+    }
 
     // precompressed copies (skipped for --dev: they'd only slow the edit loop down).
     // The APK workflow deletes them before `cap sync`; a browser host may serve them.
@@ -201,5 +211,10 @@ mod tests {
         assert!(COMPRESSED.contains(&"lightcraft_mobile.js"));
         assert!(COMPRESSED.contains(&"lightcraft_mobile_bg.wasm"));
         assert!(STATIC_FILES.contains(&"index.html"));
+        assert!(STATIC_FILES.contains(&"manifest.webmanifest"));
+        assert!(STATIC_FILES.contains(&"sw.js"));
+        assert!(ICON_FILES.contains(&"icon-192.png"));
+        assert!(ICON_FILES.contains(&"icon-512.png"));
+        assert!(ICON_FILES.contains(&"apple-touch-icon.png"));
     }
 }
