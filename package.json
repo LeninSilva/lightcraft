@@ -1,0 +1,16 @@
+{
+  "name": "lightcraft-mobile-shell",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Capacitor Android shell for the LightCraft mobile WebAssembly build. Capacitor versions are pinned exactly here and installed with --save-exact in the workflow; there is no package-lock.json.",
+  "dependencies": {
+    "@capacitor/android": "8.6.0",
+    "@capacitor/core": "8.6.0",
+    "@capacitor/filesystem": "8.1.5",
+    "@capacitor/share": "8.0.3"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "3.0.5",
+    "@capacitor/cli": "8.6.0"
+  }
+}
