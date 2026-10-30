@@ -7,6 +7,11 @@ name: Build LightCraft Mobile APK
 # This workflow does not touch the desktop-port build in build-android-apk.yml
 # (branch android-apk, artifact lightcraft-android-apk).
 # Debug APK: sideload only, not Play Store signed.
+# Capacitor is pinned: exact versions in package.json at the repo root,
+# installed with --save-exact below (no package-lock.json is committed),
+# and the shell is built against the committed capacitor.config.ts.
+# Do NOT reintroduce `npx cap init`: it merges/rewrites that config
+# depending on CLI version, so the workflow uses `cap add` + `cap sync`.
 
 on:
   push:
@@ -38,6 +43,12 @@ jobs:
       - name: Run mobile native tests
         run: cargo test -p lightcraft-mobile
 
+      # Advisory only (no -D warnings): clippy must not fail a build that the
+      # tests pass, and it cannot see wasm-only code on this native target;
+      # the wasm build below is the check for that code.
+      - name: Clippy the mobile crate
+        run: cargo clippy -p lightcraft-mobile --all-targets
+
       - name: Install wasm-bindgen-cli (exact version pinned by the repo)
         run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
 
@@ -49,7 +60,24 @@ jobs:
           test -f target/mobile-site/index.html
           test -f target/mobile-site/lightcraft_mobile_bg.wasm
           test -f target/mobile-site/lightcraft_mobile.js
+          test "$(stat -c%s target/mobile-site/lightcraft_mobile_bg.wasm)" -gt 1000000
           ls -lh target/mobile-site/
+
+      # Preserve the prebuilt static bundle for deployment (Vercel).
+      # Vercel's git import cannot build this Rust/WASM workspace, so the
+      # bundle is deployed prebuilt from this artifact, not from source.
+      # The .gz/.br copies are excluded: Vercel serves compression itself,
+      # and they would only inflate the upload.
+      - name: Upload mobile web bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightcraft-mobile-web
+          path: |
+            target/mobile-site/index.html
+            target/mobile-site/lightcraft_mobile.js
+            target/mobile-site/lightcraft_mobile_bg.wasm
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Set up Node 22 and Java 21
         uses: actions/setup-node@v4
@@ -71,23 +99,46 @@ jobs:
           rm -f www/*.gz www/*.br
           cp assets/app-icon/lightcraft-1024.png resources/icon.png
           test -f www/lightcraft_mobile_bg.wasm
-          test ! -e www/lightcraft_mobile.js.gz
+          test -z "$(find www \( -name '*.gz' -o -name '*.br' \))"
 
       - name: Install Capacitor and create the Android shell
         run: |
-          npm install @capacitor/core @capacitor/cli @capacitor/android @capacitor/assets
-          npx cap init 'LightCraft' ai.storyteller.lightcraft --web-dir=www
+          # Exact pins (Capacitor 8.6.0 core/cli/android, assets 3.0.5),
+          # matching the committed package.json. No `npx cap init`: the
+          # committed capacitor.config.ts already holds appId/appName/
+          # webDir/scheme/splash settings, and `cap add` reads it.
+          npm install --save-exact @capacitor/core@8.6.0 @capacitor/cli@8.6.0 @capacitor/android@8.6.0 @capacitor/assets@3.0.5 @capacitor/filesystem@8.1.5 @capacitor/share@8.0.3
           npx cap add android
-          npx capacitor-assets generate --android --iconBackgroundColor '#f2a516'
+          npx capacitor-assets generate --android --iconBackgroundColor '#f2a516' --splashBackgroundColor '#1c1c1c'
           # Same Kotlin stdlib duplicate fix as the desktop-port APK build.
           printf '\nconfigurations.all { exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk7" }\nconfigurations.all { exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk8" }\n' >> android/app/build.gradle
           npx cap sync
+
+      # Every build must be distinguishable on the device: versionCode from
+      # the run number, versionName from the short commit SHA. Fail loudly
+      # if the template layout ever changes and the replacements miss.
+      - name: Set APK version from run number and commit
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          sed -i -E "s/^([[:space:]]*)versionCode[[:space:]]*=?[[:space:]]*[0-9]+/\1versionCode ${GITHUB_RUN_NUMBER}/" android/app/build.gradle
+          sed -i -E "s/^([[:space:]]*)versionName[[:space:]]*=?[[:space:]]*\"[^\"]*\"/\1versionName \"${SHORT_SHA}\"/" android/app/build.gradle
+          grep -q "versionCode ${GITHUB_RUN_NUMBER}" android/app/build.gradle
+          grep -q "versionName \"${SHORT_SHA}\"" android/app/build.gradle
+          grep -E 'versionCode|versionName' android/app/build.gradle
 
       - name: Build debug APK
         run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
+
+      # The APK is only useful if the mobile bundle actually made it into
+      # the WebView assets: fail here, not on a phone, if the wasm or the
+      # entry page is missing from assets/public/.
+      - name: Check the APK contains the mobile bundle
+        run: |
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'assets/public/lightcraft_mobile_bg.wasm'
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'assets/public/index.html'
 
       - uses: actions/upload-artifact@v4
         with:
