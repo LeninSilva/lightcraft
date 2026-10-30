@@ -58,9 +58,11 @@ web-sys = { workspace = true, features = [
     "IdbTransactionMode",
     "IdbVersionChangeEvent",
     "Navigator",
+    "Node",
+    "Event",
     "Performance",
-    # Web Share API (`navigator.share` / `can_share` with files), used by ui/host.rs.
-    "ShareData",
+    # Web Share API file payload is built as a plain JS object via Reflect
+    # (web_sys::ShareData needs unstable APIs), used by ui/host.rs.
     "FilePropertyBag",
     "StorageManager",
     "Url",
