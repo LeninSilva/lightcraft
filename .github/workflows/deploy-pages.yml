@@ -1,0 +1,94 @@
+# Deploy the LightCraft Mobile web app to GitHub Pages.
+#
+# This is separate from build-mobile-apk.yml on purpose: the APK workflow
+# uploads the same bundle as an artifact, but Pages needs its own upload
+# and deploy steps, and a failure here must not fail the APK build.
+# The site is the prebuilt `cargo xtask mobile` output (index.html, JS,
+# wasm, manifest, service worker, icons). Nothing is built on Pages itself.
+# Trigger: pushes to the mobile branch, plus manual dispatch. The Pages
+# source in the repo settings must be "GitHub Actions" for this to publish.
+
+name: Deploy LightCraft Mobile to GitHub Pages
+
+on:
+  push:
+    branches: [claude/lightcraft-android-apk-nk14le]
+    paths:
+      - "apps/lightcraft-mobile/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust 1.95 + wasm target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Run mobile native tests
+        run: cargo test -p lightcraft-mobile
+
+      - name: Install wasm-bindgen-cli (exact version pinned by the repo)
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+
+      - name: Install binaryen (wasm-opt) and require it
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          wasm-opt --version
+
+      - name: Build the mobile web app
+        run: cargo xtask mobile
+
+      - name: Check the Pages bundle contains the PWA files
+        run: |
+          test -f target/mobile-site/index.html
+          test -f target/mobile-site/lightcraft_mobile.js
+          test -f target/mobile-site/lightcraft_mobile_bg.wasm
+          test -f target/mobile-site/manifest.webmanifest
+          test -f target/mobile-site/sw.js
+          test -f target/mobile-site/icons/icon-192.png
+          test -f target/mobile-site/icons/icon-512.png
+          test -f target/mobile-site/icons/apple-touch-icon.png
+          # Drop the precompressed copies: Pages serves compression itself,
+          # and they would only ship as stray .gz/.br files.
+          rm -f target/mobile-site/*.gz target/mobile-site/*.br
+          ls -R target/mobile-site
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/mobile-site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
