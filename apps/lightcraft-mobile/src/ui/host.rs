@@ -654,10 +654,23 @@ mod web_host {
                 return;
             }
         };
-        let data = web_sys::ShareData::new();
-        data.set_files(&js_sys::Array::of1(&file));
+        // Build the share payload as a plain JS object: web_sys::ShareData
+        // requires --cfg=web_sys_unstable_apis (set nowhere in this repo), and
+        // Navigator has no can_share(&ShareData)/share(&ShareData) methods (the
+        // overloads are can_share_with_data/share_with_data). Reflect calls
+        // avoid the unstable dictionary entirely.
+        let data = js_sys::Object::new();
+        let files = js_sys::Array::of1(&file);
+        if Reflect::set(data.as_ref(), &JsValue::from_str("files"), files.as_ref()).is_err() {
+            shared.push(HostEvent::Failed { what: "share".into(), message: "could not build the share request".into() });
+            return;
+        }
         let can_share = if can_share_present {
-            navigator.can_share(&data).unwrap_or(false)
+            can_share_fn
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                .and_then(|f| f.call1(&navigator_value, data.as_ref()).ok())
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
         } else {
             false
         };
@@ -666,16 +679,21 @@ mod web_host {
             download_and_answer(&shared, &name, &bytes);
             return;
         }
-        let promise = match navigator.share(&data) {
-            Ok(p) => p,
+        let Some(share_fn) = share_fn.and_then(|f| f.dyn_into::<js_sys::Function>().ok()) else {
+            shared.push(HostEvent::Failed { what: "share".into(), message: "Sharing is not available in this browser.".into() });
+            return;
+        };
+        let result = match share_fn.call1(&navigator_value, data.as_ref()) {
+            Ok(r) => r,
             Err(e) => {
                 let message = share_failure_message(&error_name(&e), "Sharing is not available in this browser.");
                 shared.push(HostEvent::Failed { what: "share".into(), message });
                 return;
             }
         };
+        let promise = js_sys::Promise::resolve(&result);
         match JsFuture::from(promise).await {
-            Ok(()) => shared.push(HostEvent::Saved { name: clean, location: "the share sheet".into() }),
+            Ok(_) => shared.push(HostEvent::Saved { name: clean, location: "the share sheet".into() }),
             Err(e) => {
                 let message = share_failure_message(&error_name(&e), "Sharing failed.");
                 shared.push(HostEvent::Failed { what: "share".into(), message });

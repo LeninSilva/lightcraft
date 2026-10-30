@@ -37,6 +37,8 @@ use std::sync::Arc;
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use host::{Host, HostEvent, HostRequest};
+use lightcraft_color::transfer::encode_srgb8;
+use lightcraft_color::{REC2020, SRGB};
 use lightcraft_develop::DevelopSettings;
 use lightcraft_pipeline::Quality;
 
@@ -309,11 +311,81 @@ impl App {
                 self.handle_loaded(key, bytes);
             }
             HostEvent::Saved { name, location } => {
-                self.set_status(format!("Saved {name} to {location}."), false);
+                // A share success arrives as Saved with the share sheet as
+                // its location; it is not a save, so it must not say so.
+                if location == "the share sheet" {
+                    self.set_status(format!("Shared {name}."), false);
+                } else {
+                    self.set_status(format!("Saved {name} to {location}."), false);
+                }
             }
             HostEvent::Failed { what, message } => {
+                if what == "storage" {
+                    self.note_storage_failure(&message);
+                }
                 self.set_status(format!("Could not {what}: {message}"), true);
             }
+        }
+    }
+
+    /// A storage failure ends the loads it can no longer answer, and an
+    /// index load that fails must not leave the library loading forever.
+    /// Storage failures name the key they were loading as
+    /// `loading {key}: ...`; a backend that never opened names no key,
+    /// and then no load answer will ever arrive. Write and delete
+    /// failures name a different verb and leave pending loads alone.
+    fn note_storage_failure(&mut self, message: &str) {
+        let load_key = message
+            .strip_prefix("loading ")
+            .and_then(|rest| rest.split(':').next());
+        match load_key {
+            Some(key) => {
+                if self.pending_open_wants(key) {
+                    self.pending_open = None;
+                }
+                if self
+                    .pending_export_version
+                    .is_some_and(|id| version_key(id) == key)
+                {
+                    self.pending_export_version = None;
+                }
+                if key == INDEX_KEY || key == INDEX_BACKUP_KEY {
+                    self.note_index_load_failed();
+                }
+            }
+            None => {
+                if message.starts_with("storing ") || message.starts_with("deleting ") {
+                    return;
+                }
+                // A generic backend failure: the pending loads have no
+                // answer coming, and an index load in flight is over.
+                self.pending_open = None;
+                self.pending_export_version = None;
+                if !self.library_loaded {
+                    self.note_index_load_failed();
+                }
+            }
+        }
+    }
+
+    /// The pending open, if any, is waiting on this storage key.
+    fn pending_open_wants(&self, key: &str) -> bool {
+        match &self.pending_open {
+            Some(PendingOpen::Photo(id)) => original_key(*id) == key,
+            Some(PendingOpen::Version(id)) => version_key(*id) == key,
+            None => false,
+        }
+    }
+
+    /// An index load failed: show the error and the empty library instead
+    /// of "Loading your library." forever. A failed backup load also
+    /// blocks index writes, as a corrupt index does, so the unreadable
+    /// stored index is never overwritten with an empty one.
+    fn note_index_load_failed(&mut self) {
+        self.library_loaded = true;
+        if self.awaiting_index_backup {
+            self.awaiting_index_backup = false;
+            self.index_write_blocked = true;
         }
     }
 
@@ -397,7 +469,13 @@ impl App {
                 return;
             }
         }
-        // Anything else that arrived is a thumbnail blob.
+        // Anything else that arrived is a thumbnail blob. A load blob
+        // whose key no longer matches a pending slot is a superseded
+        // answer (a second tap overwrote the slot): it is ignored here,
+        // never queued as a thumbnail.
+        if key.starts_with("library/original/") || key.starts_with("library/version/") {
+            return;
+        }
         if let Some(b) = bytes {
             self.pending_thumbs.push((key, b));
         }
@@ -546,14 +624,31 @@ impl App {
         self.screen = Screen::Editor;
     }
 
-    fn leave_editor(&mut self) {
-        let open_id = self.current.as_ref().and_then(|c| c.entry_id);
-        if let Some(id) = open_id {
-            let recipe = self.recipe.clone();
+    /// Store the open entry's current recipe back into the library entry
+    /// it came from, so edits are not lost when the editor is left for
+    /// another photo or version. A saved version opened for further edits
+    /// has no photo entry (`entry_id` is `None`); its recipe lives on the
+    /// version entry in `library.versions` and is written there. No-op
+    /// when nothing is open. The caller decides when the index is saved.
+    fn store_current_recipe(&mut self) {
+        let (entry_id, version_id) = match &self.current {
+            Some(c) => (c.entry_id, c.version_id),
+            None => return,
+        };
+        let recipe = self.recipe.clone();
+        if let Some(id) = entry_id {
             self.library.set_recipe(id, &recipe);
         }
-        self.save_library();
-        self.dirty_library = false;
+        if let Some(id) = version_id {
+            if let Some(version) = self.library.versions.iter_mut().find(|v| v.id == id) {
+                version.recipe = recipe;
+            }
+        }
+    }
+
+    fn leave_editor(&mut self) {
+        self.store_current_recipe();
+        self.dirty_library = true;
         self.screen = Screen::Library;
     }
 
@@ -562,13 +657,10 @@ impl App {
             self.screen = Screen::Editor;
             return;
         }
-        // Leaving an open photo first stores its recipe in the library.
-        let open_id = self.current.as_ref().and_then(|c| c.entry_id);
-        if let Some(open_id) = open_id {
-            let recipe = self.recipe.clone();
-            self.library.set_recipe(open_id, &recipe);
-            self.save_library();
-        }
+        // Leaving an open photo or version first stores its recipe in the
+        // library, so edits to a saved version are not lost either.
+        self.store_current_recipe();
+        self.save_library();
         self.pending_open = Some(PendingOpen::Photo(id));
         self.host.send(HostRequest::Get { key: original_key(id) });
         self.set_status("Opening photo.".to_string(), false);
@@ -579,6 +671,10 @@ impl App {
             self.screen = Screen::Editor;
             return;
         }
+        // Leaving an open photo or version first stores its recipe in the
+        // library, as opening another photo does.
+        self.store_current_recipe();
+        self.save_library();
         self.pending_open = Some(PendingOpen::Version(id));
         self.host.send(HostRequest::Get { key: version_key(id) });
         self.set_status("Opening saved version.".to_string(), false);
@@ -780,8 +876,9 @@ impl App {
         );
     }
 
-    /// Save the current edit to the device (the phone's Pictures folder via
-    /// the host). This is not a library version.
+    /// Save the current edit through the host (in the phone shell, the
+    /// app cache via the Filesystem plugin; in a browser, a download).
+    /// This is not a library version.
     fn export_to_device(&mut self) {
         let jpeg = match self.render_full_jpeg() {
             Ok(j) => j,
@@ -946,37 +1043,47 @@ impl App {
         self.look_thumbs.get(look_id).map(|(tex, size)| (tex.id(), *size))
     }
 
-    /// The recipe a stored thumbnail was rendered with, from its storage key.
-    fn recipe_for_thumb_key(&self, key: &str) -> Recipe {
-        if let Some(rest) = key.strip_prefix("library/thumb/") {
-            if let Ok(id) = rest.parse::<u64>() {
-                if let Some(entry) = self.library.photo(id) {
-                    return entry.recipe.clone();
-                }
-            }
+    /// A linear channel value a damaged decode can be trusted with:
+    /// finite, non-negative, bounded.
+    fn clean_channel(v: f32) -> f32 {
+        if v.is_finite() {
+            v.clamp(0.0, 64.0)
+        } else {
+            0.0
         }
-        if let Some(rest) = key.strip_prefix("library/version-thumb/") {
-            if let Ok(id) = rest.parse::<u64>() {
-                if let Some(version) = self.library.version(id) {
-                    return version.recipe.clone();
-                }
-            }
-        }
-        Recipe::default()
     }
 
     fn upload_pending_thumbs(&mut self, ctx: &egui::Context) {
         let pending = std::mem::take(&mut self.pending_thumbs);
         for (key, bytes) in pending {
-            let recipe = self.recipe_for_thumb_key(&key);
+            // A stored thumbnail is already a finished render: its JPEG
+            // is shown exactly as decoded, never run through compose()
+            // again, or the edit would be applied twice. Only the
+            // working-space (linear Rec.2020) to display sRGB conversion
+            // runs, as analysis does for its display values. A photo
+            // whose thumbnail is not yet stored simply has no texture
+            // until one is rendered and stored; nothing is rendered
+            // live from the original here.
             let photo = match Photo::open(&bytes) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let analysis = crate::analysis::analyze(&photo.proxy);
-            let settings = compose(&recipe, &analysis);
-            let rendered = photo.render(&settings, THUMB_EDGE, THUMB_EDGE, Quality::Draft);
-            let image = &rendered.image;
+            let preview = &photo.preview;
+            if preview.width == 0
+                || preview.height == 0
+                || preview.data.len() != preview.width * preview.height
+            {
+                continue;
+            }
+            let matrix = REC2020.to_space(&SRGB);
+            let image = preview.map(|p| {
+                let q = matrix.apply_f32([
+                    Self::clean_channel(p[0]),
+                    Self::clean_channel(p[1]),
+                    Self::clean_channel(p[2]),
+                ]);
+                [encode_srgb8(q[0]), encode_srgb8(q[1]), encode_srgb8(q[2]), 255]
+            });
             if image.width == 0 || image.height == 0 {
                 continue;
             }
@@ -1235,7 +1342,7 @@ impl App {
             );
             holding = resp.is_pointer_button_down_on();
         });
-        ui.label("Save version keeps a full resolution JPEG in the app. Export saves one to the device.");
+        ui.label("Save version keeps a full resolution JPEG in the app. Export saves a copy in the app cache; use Share to move it out to Photos or Files.");
         status_label(ui, self);
         // Photo area, tab bar and panel share what is left.
         let avail = ui.available_size();
