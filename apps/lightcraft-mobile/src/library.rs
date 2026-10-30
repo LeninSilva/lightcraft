@@ -301,8 +301,8 @@ mod tests {
 
     #[test]
     fn strict_index_parse_rejects_garbage_but_accepts_empty() {
-        assert!(Library::from_json_strict("").photos.is_empty());
-        assert!(Library::from_json_strict("  \n").photos.is_empty());
+        assert!(Library::from_json_strict("").unwrap().photos.is_empty());
+        assert!(Library::from_json_strict("  \n").unwrap().photos.is_empty());
         assert!(Library::from_json_strict("{{{").is_err());
         assert!(Library::from_json_strict("not json").is_err());
         let lib = Library::from_json_strict(r#"{"next_id":0,"photos":[{"id":5},{"id":5}],"versions":[]}"#).unwrap();

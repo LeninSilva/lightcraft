@@ -536,6 +536,14 @@ impl History {
         if self.last_key.as_deref() == Some(key) && !key.is_empty() {
             return;
         }
+        // A snapshot identical to the most recent one would restore the same
+        // state, so it adds a no-op undo step (e.g. a drag that returns a
+        // slider to its starting value). Skip the push, but keep the key so
+        // the rest of this gesture still coalesces.
+        if self.past.last() == Some(before) {
+            self.last_key = Some(key.to_string());
+            return;
+        }
         self.past.push(before.clone());
         if self.past.len() > MAX_HISTORY {
             self.past.remove(0);
@@ -670,6 +678,19 @@ mod tests {
         assert!(!h.can_undo());
         let fwd = h.redo(&back2).unwrap();
         assert_eq!(fwd.tune.exposure, 1.0);
+    }
+
+    #[test]
+    fn history_skips_identical_consecutive_snapshots() {
+        let mut h = History::default();
+        let r = Recipe::default();
+        h.record(&r, "a");
+        h.seal();
+        // Same state, different key: pushing it would add a no-op undo step.
+        h.record(&r, "b");
+        let back = h.undo(&r).unwrap();
+        assert_eq!(back, Recipe::default());
+        assert!(!h.can_undo());
     }
 
     #[test]
