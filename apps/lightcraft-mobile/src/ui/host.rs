@@ -182,6 +182,7 @@ fn safe_file_name(name: &str) -> &str {
 #[cfg(target_arch = "wasm32")]
 mod web_host {
     use super::{Host, HostEvent, HostRequest, base64_encode, is_cancelled, plugin_error_text, safe_file_name, share_failure_message, should_fallback_to_download};
+    use crate::library::INDEX_KEY;
     use crate::ui::storage::Backend;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -235,8 +236,15 @@ mod web_host {
         backend: Rc<RefCell<BackendState>>,
         pending: Rc<RefCell<VecDeque<HostRequest>>>,
         pumping: Rc<Cell<bool>>,
-        /// Wall-clock time, in milliseconds, when opening started.
-        opened_at_ms: f64,
+        /// The one file-picker input that may be waiting for an answer, if
+        /// any. At most one exists: a new pick removes the previous one.
+        pending_pick: Rc<RefCell<Option<web_sys::HtmlInputElement>>>,
+        /// Wall-clock time, in milliseconds, when the current open attempt started.
+        opened_at_ms: Rc<Cell<f64>>,
+        /// Generation of the current open attempt. Bumped by a retry so a
+        /// late opener from a superseded attempt cannot resolve or fail
+        /// the new one.
+        open_generation: Rc<Cell<u64>>,
     }
 
     impl WebHost {
@@ -246,44 +254,43 @@ mod web_host {
             let backend: Rc<RefCell<BackendState>> = Rc::new(RefCell::new(BackendState::Opening));
             let pending: Rc<RefCell<VecDeque<HostRequest>>> = Rc::new(RefCell::new(VecDeque::new()));
             let pumping: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            let opened_at_ms = js_sys::Date::now();
-            let (b2, p2, s2, pump2) = (backend.clone(), pending.clone(), shared.clone(), pumping.clone());
-            wasm_bindgen_futures::spawn_local(async move {
-                match Backend::open().await {
-                    Ok(b) => {
-                        log::info!("lightcraft-mobile: storage backend {}", b.kind());
-                        // Only an opener that is still pending may resolve:
-                        // a timed-out open must not resurrect the backend.
-                        let still_opening = matches!(*b2.borrow(), BackendState::Opening);
-                        if still_opening {
-                            *b2.borrow_mut() = BackendState::Ready(b);
-                            kick_worker(&b2, &p2, &s2, &pump2);
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("lightcraft-mobile: storage unavailable: {e}");
-                        let still_opening = matches!(*b2.borrow(), BackendState::Opening);
-                        if still_opening {
-                            *b2.borrow_mut() = BackendState::Failed(e.clone());
-                            for req in p2.borrow_mut().drain(..) {
-                                let _ = req;
-                                s2.push(HostEvent::Failed { what: "storage".into(), message: e.clone() });
-                            }
-                        }
-                    }
-                }
-            });
-            WebHost { shared, backend, pending, pumping, opened_at_ms }
+            let opened_at_ms = Rc::new(Cell::new(js_sys::Date::now()));
+            let open_generation = Rc::new(Cell::new(0u64));
+            let pending_pick = Rc::new(RefCell::new(None));
+            start_open(&backend, &pending, &shared, &pumping, open_generation.clone(), 0);
+            WebHost { shared, backend, pending, pumping, pending_pick, opened_at_ms, open_generation }
+        }
+
+        /// Retry opening storage after a failure (including a timeout).
+        /// Only a Failed backend retries: a backend that is still opening
+        /// keeps its own opener, and a Ready backend needs none. The
+        /// generation is bumped first, so a late opener from the failed
+        /// attempt cannot resolve or fail this new attempt (see
+        /// [`start_open`]). The initial index load is re-queued ahead of
+        /// the request that triggered the retry, because the UI sent that
+        /// Get once at startup and will not send it again; the queued
+        /// request itself runs after the backend is ready.
+        /// The UI reaches this through any storage request it sends: there
+        /// is deliberately no new `HostRequest` variant, because adding one
+        /// would break the exhaustive matches in `MemoryHost` and the test
+        /// host in `ui/mod.rs`, which this change may not touch. Tapping a
+        /// photo, picking a photo, or saving retries; doing nothing does
+        /// not retry.
+        fn retry_open(&mut self) {
+            if !matches!(*self.backend.borrow(), BackendState::Failed(_)) {
+                return;
+            }
+            let next = self.open_generation.get() + 1;
+            self.open_generation.set(next);
+            *self.backend.borrow_mut() = BackendState::Opening;
+            self.opened_at_ms.set(js_sys::Date::now());
+            start_open(&self.backend, &self.pending, &self.shared, &self.pumping, self.open_generation.clone(), next);
+            self.pending.borrow_mut().push_back(HostRequest::Get { key: INDEX_KEY.to_string() });
         }
 
         fn storage(&mut self, request: HostRequest) {
-            let failed = match &*self.backend.borrow() {
-                BackendState::Failed(message) => Some(message.clone()),
-                _ => None,
-            };
-            if let Some(message) = failed {
-                self.shared.push(HostEvent::Failed { what: "storage".into(), message });
-                return;
+            if matches!(*self.backend.borrow(), BackendState::Failed(_)) {
+                self.retry_open();
             }
             self.pending.borrow_mut().push_back(request);
             kick_worker(&self.backend, &self.pending, &self.shared, &self.pumping);
@@ -338,6 +345,45 @@ mod web_host {
         });
     }
 
+    /// Open the storage backend in the background. Only the opener whose
+    /// generation is still current and whose backend is still Opening may
+    /// resolve or fail it: a timed-out opener must not resurrect a backend
+    /// the watchdog already failed, and a superseded opener (one whose
+    /// attempt a retry replaced) must not fail the retry's attempt.
+    fn start_open(
+        backend: &Rc<RefCell<BackendState>>,
+        pending: &Rc<RefCell<VecDeque<HostRequest>>>,
+        shared: &Shared,
+        pumping: &Rc<Cell<bool>>,
+        generations: Rc<Cell<u64>>,
+        generation: u64,
+    ) {
+        let (b2, p2, s2, pump2) = (backend.clone(), pending.clone(), shared.clone(), pumping.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            match Backend::open().await {
+                Ok(b) => {
+                    log::info!("lightcraft-mobile: storage backend {}", b.kind());
+                    let current = generations.get() == generation && matches!(*b2.borrow(), BackendState::Opening);
+                    if current {
+                        *b2.borrow_mut() = BackendState::Ready(b);
+                        kick_worker(&b2, &p2, &s2, &pump2);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("lightcraft-mobile: storage unavailable: {e}");
+                    let current = generations.get() == generation && matches!(*b2.borrow(), BackendState::Opening);
+                    if current {
+                        *b2.borrow_mut() = BackendState::Failed(e.clone());
+                        for req in p2.borrow_mut().drain(..) {
+                            let _ = req;
+                            s2.push(HostEvent::Failed { what: "storage".into(), message: e.clone() });
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     impl Host for WebHost {
         fn now_ms(&self) -> f64 {
             js_sys::Date::now()
@@ -345,7 +391,7 @@ mod web_host {
 
         fn send(&mut self, request: HostRequest) {
             match request {
-                HostRequest::PickPhoto => pick_photo(self.shared.clone()),
+                HostRequest::PickPhoto => pick_photo(self.shared.clone(), self.pending_pick.clone()),
                 HostRequest::Put { .. } | HostRequest::Get { .. } | HostRequest::Delete { .. } => self.storage(request),
                 HostRequest::SaveToDevice { name, bytes } => {
                     // Saving is asynchronous in the Capacitor shell (a plugin
@@ -372,13 +418,12 @@ mod web_host {
             // leaving the library loading forever. A late opener is ignored
             // by the still-opening guard in `new`.
             let still_opening = matches!(*self.backend.borrow(), BackendState::Opening);
-            if still_opening && js_sys::Date::now() - self.opened_at_ms > OPEN_TIMEOUT_MS {
+            if still_opening && js_sys::Date::now() - self.opened_at_ms.get() > OPEN_TIMEOUT_MS {
                 let message = "storage did not open in time".to_string();
                 *self.backend.borrow_mut() = BackendState::Failed(message.clone());
                 for _ in self.pending.borrow_mut().drain(..) {
                     self.shared.push(HostEvent::Failed { what: "storage".into(), message: message.clone() });
                 }
-                self.shared.push(HostEvent::Failed { what: "storage".into(), message });
             }
             self.shared.events.borrow_mut().drain(..).collect()
         }
@@ -495,15 +540,20 @@ mod web_host {
         JsFuture::from(promise).await
     }
 
-    /// Write `bytes` to the Capacitor Filesystem Cache directory and return
-    /// the file URI the plugin reports, falling back to `getUri` when the
-    /// write result carries none. The Cache directory needs no storage
-    /// permission, so this succeeds where writing to shared storage would
-    /// fail under scoped storage; the file is real and shareable, but it
-    /// does NOT land in the phone's Downloads folder or Photos, and the
-    /// returned URI is reported as the location so the UI never claims
-    /// otherwise. Err carries a human-readable message.
-    async fn capacitor_write_file(name: &str, bytes: &[u8]) -> Result<String, String> {
+    /// Write `bytes` with the Capacitor Filesystem plugin and return the
+    /// file URI the plugin reports, falling back to `getUri` when the
+    /// write result carries none. `directory` is the plugin's Directory
+    /// enum name, passed through unchanged ("CACHE" needs no storage
+    /// permission; "DOCUMENTS" is the user-visible documents directory).
+    /// No permission call is made here: whether the plugin's
+    /// `checkPermissions`/`requestPermissions` apply to this directory on
+    /// the target device could not be verified from the plugin's official
+    /// docs in this change, so no guessed permission call is added; a
+    /// denied write surfaces as a `Failed` event with the plugin's reason.
+    /// The caller decides what location text the user sees: the raw URI
+    /// is returned here and must not be shown as a user-facing path.
+    /// Err carries a human-readable message.
+    async fn capacitor_write_file(directory: &str, name: &str, bytes: &[u8]) -> Result<String, String> {
         let plugin = capacitor_plugin("Filesystem", "writeFile")
             .ok_or_else(|| "the Filesystem plugin is not installed in this build".to_string())?;
         let clean = safe_file_name(name).to_string();
@@ -511,7 +561,7 @@ mod web_host {
         let opts = js_sys::Object::new();
         set_opt(&opts, "path", &path)?;
         set_opt(&opts, "data", &base64_encode(bytes))?;
-        set_opt(&opts, "directory", "CACHE")?;
+        set_opt(&opts, "directory", directory)?;
         Reflect::set(opts.as_ref(), &JsValue::from_str("recursive"), &JsValue::from_bool(true))
             .map(|_| ())
             .map_err(|e| plugin_error(&e))?;
@@ -523,7 +573,7 @@ mod web_host {
         }
         let uri_opts = js_sys::Object::new();
         set_opt(&uri_opts, "path", &path)?;
-        set_opt(&uri_opts, "directory", "CACHE")?;
+        set_opt(&uri_opts, "directory", directory)?;
         let result = call_plugin(&plugin, "getUri", &uri_opts).await.map_err(|e| plugin_error(&e))?;
         Reflect::get(&result, &JsValue::from_str("uri"))
             .ok()
@@ -533,13 +583,18 @@ mod web_host {
     }
 
     /// Save `bytes` where the user can get at them, answering only from the
-    /// real result. In a Capacitor shell the file is written with the
-    /// Filesystem plugin (see [`capacitor_write_file`]); in a browser the
-    /// existing anchor download is kept unchanged.
+    /// real result. In a Capacitor shell the file is written to the
+    /// Documents directory with the Filesystem plugin (see
+    /// [`capacitor_write_file`]) and the answer reports the human-readable
+    /// location `Documents/lightcraft/<name>`, never the raw plugin URI;
+    /// in a browser the existing anchor download is kept unchanged.
     async fn save_to_device(shared: Shared, name: String, bytes: Vec<u8>) {
         if capacitor_present() {
-            match capacitor_write_file(&name, &bytes).await {
-                Ok(uri) => shared.push(HostEvent::Saved { name: safe_file_name(&name).to_string(), location: uri }),
+            match capacitor_write_file("DOCUMENTS", &name, &bytes).await {
+                Ok(_) => shared.push(HostEvent::Saved {
+                    name: safe_file_name(&name).to_string(),
+                    location: format!("Documents/lightcraft/{}", safe_file_name(&name)),
+                }),
                 Err(message) => shared.push(HostEvent::Failed { what: "save".into(), message }),
             }
             return;
@@ -559,7 +614,7 @@ mod web_host {
     /// is missing.
     async fn capacitor_share(shared: Shared, name: String, bytes: Vec<u8>) {
         let clean = safe_file_name(&name).to_string();
-        let uri = match capacitor_write_file(&name, &bytes).await {
+        let uri = match capacitor_write_file("CACHE", &name, &bytes).await {
             Ok(uri) => uri,
             Err(message) => {
                 shared.push(HostEvent::Failed { what: "share".into(), message });
@@ -710,17 +765,18 @@ mod web_host {
     }
 
     /// Show the browser's open dialog; the picked file is read asynchronously and answers
-    /// [`HostEvent::Picked`]. Cancelling the dialog fires no event in most browsers, so the
-    /// app simply waits (the same limitation as the desktop web app's picker); the app no
-    /// longer blocks Add photo on a pending pick, so a cancelled pick costs one more tap.
-    /// Every failure path here answers `PickCancelled`, so the app is never left
+    /// [`HostEvent::Picked`]. Cancelling the dialog fires a `cancel` event in current
+    /// Chromium-based WebViews and answers `PickCancelled`; in a browser that does not
+    /// fire it the app simply waits, as before, and the next pick removes the leftover
+    /// input. Every failure path here answers `PickCancelled`, so the app is never left
     /// waiting on a picker that cannot open. The input is appended to the document
     /// body, visually hidden, before it is clicked: a detached input is enough in
     /// desktop Chrome, but in an Android WebView the native file chooser is driven
-    /// for inputs in the page, and a detached input may open nothing at all. The
-    /// input is removed from the body in the change handler, on every path
-    /// (picked, empty, or no files), so hidden inputs never accumulate.
-    fn pick_photo(shared: Shared) {
+    /// for inputs in the page, and a detached input may open nothing at all. At most
+    /// one pending input exists (`pending_pick`): a new pick removes any previous one
+    /// first, and whichever handler runs first (change or cancel) claims the input,
+    /// so a pick is never answered twice and hidden inputs never accumulate.
+    fn pick_photo(shared: Shared, pending_pick: Rc<RefCell<Option<web_sys::HtmlInputElement>>>) {
         let Some(window) = web_sys::window() else {
             shared.push(HostEvent::PickCancelled);
             return;
@@ -740,6 +796,12 @@ mod web_host {
             shared.push(HostEvent::PickCancelled);
             return;
         };
+        // One pending input at most: remove any input a previous pick left
+        // behind (its dialog never answered) before creating a new one, so
+        // cancelled picks do not leak hidden inputs into the document.
+        if let Some(old) = pending_pick.borrow_mut().take() {
+            let _ = body.remove_child(old.unchecked_ref());
+        }
         let input_node: &web_sys::Node = input.unchecked_ref();
         if input.set_attribute("style", "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;").is_err()
             || body.append_child(input_node).is_err()
@@ -747,11 +809,16 @@ mod web_host {
             shared.push(HostEvent::PickCancelled);
             return;
         }
-        let inp = input.clone();
+        pending_pick.borrow_mut().replace(input.clone());
         let body_for_handler = body.clone();
+        let pending_for_change = pending_pick.clone();
         let on_change = Closure::<dyn FnMut()>::new(move || {
-            // Remove the hidden input first: every path below answers, and
-            // the element must not stay in the document either way.
+            // Claim the pending input: whichever handler runs first takes
+            // it, and the other finds nothing and stays silent, so a pick
+            // is never answered twice.
+            let Some(inp) = pending_for_change.borrow_mut().take() else {
+                return;
+            };
             let _ = body_for_handler.remove_child(inp.unchecked_ref());
             let Some(files) = inp.files() else {
                 shared.push(HostEvent::PickCancelled);
@@ -775,6 +842,28 @@ mod web_host {
         });
         input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
         on_change.forget();
+        // The cancel event fires when the dialog is dismissed without a
+        // file. It is registered through `EventTarget` (the `cancel`
+        // handler property is not a stable web-sys setter on this element),
+        // using only the already-enabled `EventTarget` feature. Browsers
+        // that do not fire it leave the pick unanswered, as before; the
+        // pending input is removed by the next pick. No focus-return
+        // fallback is added: a focus event cannot tell the dialog opening
+        // from it closing without timer plumbing, so it would risk
+        // answering a pick the user has not finished making, and the
+        // pending-input guard alone cannot make that safe.
+        let pending_for_cancel = pending_pick.clone();
+        let body_for_cancel = body.clone();
+        let shared_for_cancel = shared.clone();
+        let on_cancel = Closure::<dyn FnMut()>::new(move || {
+            let Some(inp) = pending_for_cancel.borrow_mut().take() else {
+                return;
+            };
+            let _ = body_for_cancel.remove_child(inp.unchecked_ref());
+            shared_for_cancel.push(HostEvent::PickCancelled);
+        });
+        let _ = input.add_event_listener_with_callback("cancel", on_cancel.as_ref().unchecked_ref());
+        on_cancel.forget();
         input.click();
     }
 

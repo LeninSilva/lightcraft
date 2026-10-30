@@ -197,8 +197,20 @@ pub struct App {
     armed_remove: Option<RemovalTarget>,
     /// The stored index (and its backup) could not be read: index writes are
     /// blocked until a good index loads, so a corrupt index is never saved
-    /// over. Cleared only by a successful index load.
+    /// over. Cleared only by `adopt_library` after a successful parse.
     index_write_blocked: bool,
+    /// A stored index was successfully parsed and adopted (or no index
+    /// was stored yet, which adopts an empty library). Until this is set,
+    /// a failed index load must start backup recovery, never silently
+    /// show an empty library.
+    good_index_loaded: bool,
+    /// The last index load failed and no good index was adopted: the
+    /// library screen shows a persistent error with a Retry button.
+    index_load_failed: bool,
+    /// A Put of the index failed: the library screen shows a persistent
+    /// error with a Retry button, and automatic index flushes pause
+    /// until the user retries.
+    index_save_failed: bool,
     /// A backup index load is in flight after a corrupt main index.
     awaiting_index_backup: bool,
     /// The library index needs writing (a recipe changed); flushed at the end
@@ -234,6 +246,9 @@ impl App {
             armed_remove: None,
             index_write_blocked: false,
             awaiting_index_backup: false,
+            good_index_loaded: false,
+            index_load_failed: false,
+            index_save_failed: false,
             dirty_library: false,
         };
         app.host.send(HostRequest::Get { key: INDEX_KEY.to_string() });
@@ -273,9 +288,13 @@ impl App {
         }
         self.dragging = any_dragged;
         self.holding_compare = holding;
-        if self.dirty_library && !self.dragging {
-            self.save_library();
-            self.dirty_library = false;
+        if self.dirty_library && !self.dragging && !self.index_save_failed {
+            // Keep the pending write when it could not be sent (library
+            // not loaded, backup recovery in flight, or writes blocked):
+            // clearing it would drop the edit that still needs saving.
+            if self.save_library() {
+                self.dirty_library = false;
+            }
         }
         if self.dragging {
             ui.ctx().request_repaint();
@@ -287,16 +306,22 @@ impl App {
         self.status_error = error;
     }
 
-    fn save_library(&mut self) {
-        // Blocked after a corrupt index load: never persist over a stored
-        // index that could not be read. The backup copy is written alongside
-        // every good index, so a corrupt main index can fall back to it.
-        if self.index_write_blocked {
-            return;
+    /// Write the library index (and its backup copy). Returns false, having
+    /// sent nothing, when the library has not loaded yet, when backup
+    /// recovery is in flight, or when writes are blocked after an
+    /// unreadable index: in all three cases the in-memory library is
+    /// incomplete or unreconciled, and persisting it could overwrite the
+    /// stored index with an empty or partial one. The caller keeps its
+    /// pending write (see `frame`) so it is retried once a good index
+    /// loads.
+    fn save_library(&mut self) -> bool {
+        if self.index_write_blocked || !self.library_loaded || self.awaiting_index_backup {
+            return false;
         }
         let bytes = self.library.to_json().into_bytes();
         self.host.send(HostRequest::Put { key: INDEX_KEY.to_string(), bytes: bytes.clone() });
         self.host.send(HostRequest::Put { key: INDEX_BACKUP_KEY.to_string(), bytes });
+        true
     }
 
     fn handle_event(&mut self, event: HostEvent) {
@@ -328,13 +353,27 @@ impl App {
         }
     }
 
-    /// A storage failure ends the loads it can no longer answer, and an
-    /// index load that fails must not leave the library loading forever.
-    /// Storage failures name the key they were loading as
-    /// `loading {key}: ...`; a backend that never opened names no key,
-    /// and then no load answer will ever arrive. Write and delete
-    /// failures name a different verb and leave pending loads alone.
+    /// A storage failure ends the loads it can no longer answer. A failed
+    /// index Put keeps the pending write (`dirty_library`) and raises a
+    /// persistent error with Retry, instead of the write being dropped.
+    /// A failed index load starts backup recovery (see
+    /// `start_corrupt_index_recovery`) and blocks index writes until a
+    /// good index is adopted. Storage failures name the key they were
+    /// loading as `loading {key}: ...` or storing as `storing {key}: ...`;
+    /// a backend that never opened names no key, and then no load answer
+    /// will ever arrive. Delete failures leave pending loads alone.
     fn note_storage_failure(&mut self, message: &str) {
+        if let Some(rest) = message.strip_prefix("storing ") {
+            let key = rest.split(':').next().unwrap_or("");
+            if key == INDEX_KEY || key == INDEX_BACKUP_KEY {
+                self.dirty_library = true;
+                self.index_save_failed = true;
+            }
+            return;
+        }
+        if message.starts_with("deleting ") {
+            return;
+        }
         let load_key = message
             .strip_prefix("loading ")
             .and_then(|rest| rest.split(':').next());
@@ -349,14 +388,21 @@ impl App {
                 {
                     self.pending_export_version = None;
                 }
-                if key == INDEX_KEY || key == INDEX_BACKUP_KEY {
+                if key == INDEX_KEY {
+                    // No good index adopted yet: the stored index could
+                    // not be read, so try the backup copy and block
+                    // writes until one of them parses.
+                    if !self.good_index_loaded && !self.awaiting_index_backup {
+                        self.index_load_failed = true;
+                        self.start_corrupt_index_recovery(
+                            "The saved library index could not be loaded.",
+                        );
+                    }
+                } else if key == INDEX_BACKUP_KEY && self.awaiting_index_backup {
                     self.note_index_load_failed();
                 }
             }
             None => {
-                if message.starts_with("storing ") || message.starts_with("deleting ") {
-                    return;
-                }
                 // A generic backend failure: the pending loads have no
                 // answer coming, and an index load in flight is over.
                 self.pending_open = None;
@@ -377,15 +423,43 @@ impl App {
         }
     }
 
-    /// An index load failed: show the error and the empty library instead
-    /// of "Loading your library." forever. A failed backup load also
-    /// blocks index writes, as a corrupt index does, so the unreadable
-    /// stored index is never overwritten with an empty one.
+    /// An index load failed: show the library (empty) instead of
+    /// "Loading your library." forever, and, when no good index was
+    /// adopted, block index writes and raise the persistent load error
+    /// so the unreadable stored index is never overwritten with an empty
+    /// one. The block is cleared only by `adopt_library` after a
+    /// successful parse.
     fn note_index_load_failed(&mut self) {
         self.library_loaded = true;
-        if self.awaiting_index_backup {
-            self.awaiting_index_backup = false;
+        if !self.good_index_loaded {
             self.index_write_blocked = true;
+            self.index_load_failed = true;
+        }
+        self.awaiting_index_backup = false;
+    }
+
+    /// Retry after a failed index load or a failed index save, from the
+    /// Retry button on the library screen. When no good index was ever
+    /// adopted, the retry re-sends the Get for the main index (backup
+    /// recovery runs again if that load also fails). Otherwise it
+    /// re-attempts the pending index write.
+    fn retry_storage(&mut self) {
+        if !self.good_index_loaded {
+            self.index_load_failed = false;
+            self.index_save_failed = false;
+            self.awaiting_index_backup = false;
+            self.library_loaded = false;
+            self.host.send(HostRequest::Get { key: INDEX_KEY.to_string() });
+            self.set_status("Trying to load the saved library again.".to_string(), false);
+        } else {
+            self.index_save_failed = false;
+            if self.save_library() {
+                self.dirty_library = false;
+                self.set_status("The library index was saved.".to_string(), false);
+            } else {
+                self.index_save_failed = true;
+                self.set_status("The library index still could not be saved.".to_string(), true);
+            }
         }
     }
 
@@ -404,7 +478,10 @@ impl App {
             match good {
                 Some(lib) => {
                     self.adopt_library(lib);
-                    self.index_write_blocked = false;
+                    // Repair: write the adopted library back as the main
+                    // index, so the next launch does not need the backup
+                    // again. `adopt_library` cleared the write block.
+                    self.save_library();
                     self.set_status(
                         "The saved library index could not be read, so the backup copy was used instead.".to_string(),
                         false,
@@ -417,9 +494,11 @@ impl App {
         if key == INDEX_KEY {
             match bytes {
                 None => {
-                    // First run: no stored index yet.
-                    self.library = Library::default();
-                    self.library_loaded = true;
+                    // First run: no stored index yet. Adopting the empty
+                    // library is the successful parse that clears the
+                    // write block, so a later failure cannot leave
+                    // writes blocked forever.
+                    self.adopt_library(Library::default());
                 }
                 Some(b) => match String::from_utf8(b) {
                     Ok(text) => match Library::from_json_strict(&text) {
@@ -481,10 +560,17 @@ impl App {
         }
     }
 
-    /// Adopt a successfully parsed index and fetch its thumbnails.
+    /// Adopt a successfully parsed index and fetch its thumbnails. This
+    /// is the only place that clears the index write block and the
+    /// load/save failure flags: a good parse is the proof the stored
+    /// index (or its absence, on a first run) was read correctly.
     fn adopt_library(&mut self, lib: Library) {
         self.library = lib;
         self.library_loaded = true;
+        self.good_index_loaded = true;
+        self.index_write_blocked = false;
+        self.index_load_failed = false;
+        self.index_save_failed = false;
         for entry in self.library.recent() {
             let k = thumb_key(entry.id);
             self.host.send(HostRequest::Get { key: k });
@@ -496,9 +582,12 @@ impl App {
     }
 
     /// A stored index could not be read: keep the in-memory library untouched
-    /// and try the backup copy. Index writes stay possible only if the backup
-    /// loads; if it does not, `finish_corrupt_index` blocks them.
+    /// and try the backup copy. Index writes are blocked from here until
+    /// the backup is adopted (only `adopt_library` clears the block), so
+    /// nothing written while recovery is in flight can overwrite the
+    /// stored index with an incomplete library.
     fn start_corrupt_index_recovery(&mut self, message: &str) {
+        self.index_write_blocked = true;
         self.awaiting_index_backup = true;
         self.set_status(
             format!("{message} Trying the backup copy. Your stored photos are still there."),
@@ -509,11 +598,14 @@ impl App {
 
     /// Neither the index nor its backup could be read: keep the in-memory
     /// library, show the error, and block index writes so the unreadable
-    /// stored index is never overwritten with an empty one.
+    /// stored index is never overwritten with an empty one. The
+    /// persistent load error and its Retry button stay up until a
+    /// readable index loads.
     fn finish_corrupt_index(&mut self) {
         self.awaiting_index_backup = false;
         self.library_loaded = true;
         self.index_write_blocked = true;
+        self.index_load_failed = true;
         self.set_status(
             "The saved library index and its backup could not be read. Your stored photos are still there, but edits will not be saved to the library index until a readable index loads.".to_string(),
             true,
@@ -578,7 +670,13 @@ impl App {
             self.host.send(HostRequest::Delete { key: key.clone() });
             self.thumbs.remove(&key);
         }
-        self.save_library();
+        if !self.save_library() {
+            // The index is not loaded yet, recovery is in flight, or
+            // writes are blocked: keep the pending write so the frame
+            // flush retries it once a good index loads, instead of
+            // dropping the new entry.
+            self.dirty_library = true;
+        }
         let display_name = self
             .library
             .photo(id)
@@ -1136,19 +1234,26 @@ impl App {
     fn library_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("LightCraft");
         ui.label("A quiet editor for your photos.");
-        if ui
-            .add_sized(
-                egui::vec2(ui.available_width(), MIN_TOUCH + 4.0),
-                egui::Button::new("Add photo"),
-            )
-            .clicked()
-        {
-            // No picker-open guard: cancelling the browser picker fires no
-            // event in most browsers, so a guard would deadlock Add photo
-            // until restart. Opening a second picker input is harmless.
-            self.host.send(HostRequest::PickPhoto);
-            self.set_status("Choose a photo.".to_string(), false);
-        }
+        // While the library is loading or backup recovery is in flight,
+        // adding a photo could be saved over the stored index with an
+        // incomplete library, so Add photo stays disabled until the
+        // library loads.
+        let library_ready = self.library_loaded && !self.awaiting_index_backup;
+        ui.add_enabled_ui(library_ready, |ui| {
+            if ui
+                .add_sized(
+                    egui::vec2(ui.available_width(), MIN_TOUCH + 4.0),
+                    egui::Button::new("Add photo"),
+                )
+                .clicked()
+            {
+                // No picker-open guard: cancelling the browser picker fires no
+                // event in most browsers, so a guard would deadlock Add photo
+                // until restart. Opening a second picker input is harmless.
+                self.host.send(HostRequest::PickPhoto);
+                self.set_status("Choose a photo.".to_string(), false);
+            }
+        });
         ui.label(format!(
             "Keeping {} photos, {} stored. Saved versions are always kept. Unkept photos beyond the {} most recent are let go.",
             self.library.photos.len(),
@@ -1156,9 +1261,37 @@ impl App {
             KEEP_RECENT
         ));
         if !self.library_loaded {
-            ui.label("Loading your library.");
+            ui.label("Loading your library. Adding and changing photos is paused until it loads.");
         }
         status_label(ui, self);
+        if self.index_load_failed || self.index_save_failed {
+            if self.index_load_failed {
+                ui.label(
+                    egui::RichText::new(
+                        "The saved library index could not be loaded. Your stored photos are still there.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 80, 80)),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "The library index could not be saved. Your edits are kept in this session.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 80, 80)),
+                );
+            }
+            if ui
+                .add_sized(
+                    egui::vec2(ui.available_width(), MIN_TOUCH),
+                    egui::Button::new("Retry"),
+                )
+                .clicked()
+            {
+                self.retry_storage();
+            }
+        }
         let filter_w = ui.available_width();
         ui.horizontal(|ui| {
             for (tab, label) in [
@@ -1204,18 +1337,24 @@ impl App {
                 }
             }
         });
-        for action in actions {
-            match action {
-                GridAction::OpenPhoto(id) => self.request_open_photo(id),
-                GridAction::ToggleKeep(id) => self.toggle_keep(id),
-                GridAction::RemovePhoto(id) => self.remove_photo_action(id),
-                GridAction::OpenVersion(id) => self.request_open_version(id),
-                GridAction::ExportVersion(id) => {
-                    self.pending_export_version = Some(id);
-                    self.host.send(HostRequest::Get { key: version_key(id) });
-                    self.set_status("Getting the saved version.".to_string(), false);
+        // Grid actions are dropped while the library is loading or backup
+        // recovery is in flight: a keep, remove, or open applied to the
+        // in-memory library before recovery finishes could delete blobs
+        // the recovered index still names, or be saved over it.
+        if library_ready {
+            for action in actions {
+                match action {
+                    GridAction::OpenPhoto(id) => self.request_open_photo(id),
+                    GridAction::ToggleKeep(id) => self.toggle_keep(id),
+                    GridAction::RemovePhoto(id) => self.remove_photo_action(id),
+                    GridAction::OpenVersion(id) => self.request_open_version(id),
+                    GridAction::ExportVersion(id) => {
+                        self.pending_export_version = Some(id);
+                        self.host.send(HostRequest::Get { key: version_key(id) });
+                        self.set_status("Getting the saved version.".to_string(), false);
+                    }
+                    GridAction::DeleteVersion(id) => self.remove_version_action(id),
                 }
-                GridAction::DeleteVersion(id) => self.remove_version_action(id),
             }
         }
     }
@@ -2295,5 +2434,74 @@ mod tests {
         assert_eq!(fresh2.library.photos.len(), 1);
         assert!(fresh2.library.photos[0].kept);
         assert!(!fresh2.index_write_blocked);
+    }
+
+    #[test]
+    fn failed_index_load_tries_backup_blocks_writes_and_retries() {
+        let (mut app, state) = app_with_test_host();
+        // The main index load fails: recovery tries the backup copy and
+        // index writes are blocked, instead of showing an empty library
+        // that a later save could persist over the stored index.
+        app.handle_event(HostEvent::Failed {
+            what: "storage".to_string(),
+            message: format!("loading {INDEX_KEY}: boom"),
+        });
+        assert!(app.awaiting_index_backup);
+        assert!(app.index_write_blocked);
+        assert!(app.index_load_failed);
+        // The backup load fails too: still blocked, with Retry available.
+        app.handle_event(HostEvent::Failed {
+            what: "storage".to_string(),
+            message: format!("loading {INDEX_BACKUP_KEY}: boom"),
+        });
+        assert!(!app.awaiting_index_backup);
+        assert!(app.index_write_blocked);
+        assert!(app.index_load_failed);
+        assert!(app.library_loaded);
+        // Writes stay blocked: save_library sends nothing.
+        let before = state.borrow().requests.len();
+        app.save_library();
+        assert_eq!(state.borrow().requests.len(), before);
+        // Retry re-sends the Get for the main index.
+        app.retry_storage();
+        assert!(state
+            .borrow()
+            .requests
+            .iter()
+            .any(|r| r == &format!("get {INDEX_KEY}")));
+        assert!(!app.library_loaded);
+        // The retry load finds no stored index: adopting the empty
+        // library clears the block.
+        app.handle_event(HostEvent::Loaded { key: INDEX_KEY.to_string(), bytes: None });
+        assert!(app.good_index_loaded);
+        assert!(!app.index_write_blocked);
+        assert!(!app.index_load_failed);
+    }
+
+    #[test]
+    fn failed_index_save_keeps_dirty_and_retries() {
+        let (mut app, state) = app_with_test_host();
+        let index = app.library.to_json().into_bytes();
+        app.handle_event(HostEvent::Loaded { key: INDEX_KEY.to_string(), bytes: Some(index) });
+        assert!(app.good_index_loaded);
+        assert!(!app.index_write_blocked);
+        // A failed Put of the index keeps the pending write and raises
+        // the persistent save error, instead of dropping the edit.
+        app.dirty_library = true;
+        app.handle_event(HostEvent::Failed {
+            what: "storage".to_string(),
+            message: format!("storing {INDEX_KEY}: disk full"),
+        });
+        assert!(app.dirty_library);
+        assert!(app.index_save_failed);
+        // Retry re-attempts the pending index write.
+        app.retry_storage();
+        assert!(state
+            .borrow()
+            .requests
+            .iter()
+            .any(|r| r == &format!("put {INDEX_KEY}")));
+        assert!(!app.dirty_library);
+        assert!(!app.index_save_failed);
     }
 }
