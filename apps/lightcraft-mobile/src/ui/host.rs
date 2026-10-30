@@ -444,8 +444,7 @@ mod web_host {
     /// The Capacitor plugin object named `name`, when this page runs inside a
     /// Capacitor shell that installed that plugin and the named method is a
     /// function, or `None` otherwise. Deliberately strict: a Capacitor shell
-    /// without the plugin installed (the APK workflow installs only
-    /// core/cli/android/assets today) reports `None`, and callers must say
+    /// without the plugin installed reports `None`, and callers must say
     /// the plugin is missing instead of claiming success through a path
     /// that does nothing in a WebView.
     fn capacitor_plugin(name: &str, method: &str) -> Option<JsValue> {
