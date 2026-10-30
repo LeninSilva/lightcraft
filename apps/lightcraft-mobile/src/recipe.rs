@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use lightcraft_develop::{DevelopSettings, LocalAdjustments, Mask, MaskComponent, MaskShape, Treatment};
+use lightcraft_develop::{DevelopSettings, LocalAdjustments, Mask, MaskComponent, MaskShape, Treatment, WbMode};
 use lightcraft_geom::{Orientation, Point, Rect};
 
 use crate::analysis::Analysis;
@@ -343,12 +343,15 @@ pub fn relative_temp(r: f64) -> f64 {
     1e6 / (1e6 / 6500.0 - clamp(r, -100.0, 100.0) * 0.8)
 }
 
-/// Inverse of [`relative_temp`].
+/// Inverse of [`relative_temp`]. Unclamped: clamping to -100..100 destroys
+/// information for base temperatures below 4276 K (the relative scale's
+/// floor), so a warm base can never round-trip. The non-positive and
+/// non-finite guard stays: those temperatures have no relative value.
 pub fn temp_to_relative(k: f64) -> f64 {
     if k <= 0.0 || !k.is_finite() {
         return 0.0;
     }
-    clamp((1e6 / 6500.0 - 1e6 / k) / 0.8, -100.0, 100.0)
+    (1e6 / 6500.0 - 1e6 / k) / 0.8
 }
 
 fn apply_tune(s: &mut DevelopSettings, t: &Tune) {
@@ -364,6 +367,11 @@ fn apply_tune(s: &mut DevelopSettings, t: &Tune) {
     add(&mut s.effects.dehaze, t.dehaze);
     s.wb.temp = relative_temp(temp_to_relative(s.wb.temp) + t.warmth);
     s.wb.tint = clamp(s.wb.tint + t.tint, -150.0, 150.0);
+    // A nonzero warmth/tint change only renders with an explicit mode: the
+    // pipeline returns the as-shot white whenever the mode is `AsShot`.
+    if t.warmth != 0.0 || t.tint != 0.0 {
+        s.wb.mode = WbMode::Custom;
+    }
     add(&mut s.color.vibrance, t.vibrance + t.hdr * 0.1);
     add(&mut s.color.saturation, t.saturation);
     if t.fade > 0.0 {
@@ -382,7 +390,13 @@ fn apply_tune(s: &mut DevelopSettings, t: &Tune) {
     }
     add(&mut s.vignette.amount, t.vignette);
     s.grain.amount = clamp(s.grain.amount + t.grain, 0.0, 100.0);
-    if t.grain > 0.0 {
+    // The size override applies whenever grain is present (from a look or
+    // the Grain slider) and the user set a size, or added grain through the
+    // slider. Gating on the Grain slider alone left the size slider dead
+    // when the grain came only from a look; gating on grain alone would
+    // move the size from its default whenever a look adds grain and the
+    // user never touched the size slider.
+    if s.grain.amount > 0.0 && (t.grain > 0.0 || t.grain_size != 0.0) {
         s.grain.size = clamp(10.0 + t.grain_size * 0.8, 0.0, 100.0);
     }
     s.detail.sharpen_amount = clamp(s.detail.sharpen_amount + t.sharpen, 0.0, 150.0);
@@ -622,6 +636,40 @@ mod tests {
             assert!((temp_to_relative(relative_temp(r)) - r).abs() < 1e-9);
         }
         assert_eq!(relative_temp(0.0), 6500.0);
+        // Below the relative scale's floor the value is not clamped away:
+        // 3000 K maps below -100, and the guard still holds for bad input.
+        assert!(temp_to_relative(3000.0) < -100.0);
+        assert_eq!(temp_to_relative(0.0), 0.0);
+        assert_eq!(temp_to_relative(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn grain_size_slider_works_when_grain_comes_from_a_look() {
+        let mut r = Recipe::default();
+        r.look = Some("matte".to_string());
+        r.look_strength = 100.0;
+        // Grain from the look alone, size untouched: the default size stays.
+        assert_eq!(compose(&r, &analysis()).grain.size, 25.0);
+        // Size set, Grain slider untouched: the size override applies.
+        r.tune.grain_size = 50.0;
+        assert_eq!(compose(&r, &analysis()).grain.size, 50.0);
+        // Grain added through the slider still sizes the grain as before.
+        let mut r2 = Recipe::default();
+        r2.tune.grain = 10.0;
+        assert_eq!(compose(&r2, &analysis()).grain.size, 10.0);
+        r2.tune.grain_size = 50.0;
+        assert_eq!(compose(&r2, &analysis()).grain.size, 50.0);
+    }
+
+    #[test]
+    fn nonzero_warmth_or_tint_sets_custom_white_balance() {
+        let mut r = Recipe::default();
+        r.tune.warmth = 20.0;
+        assert_eq!(compose(&r, &analysis()).wb.mode, WbMode::Custom);
+        let mut r = Recipe::default();
+        r.tune.tint = -20.0;
+        assert_eq!(compose(&r, &analysis()).wb.mode, WbMode::Custom);
+        assert_eq!(compose(&Recipe::default(), &analysis()).wb.mode, DevelopSettings::default().wb.mode);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use lightcraft_develop::DevelopSettings;
+use lightcraft_develop::{DevelopSettings, WbMode};
 
 use crate::analysis::{Analysis, Scene};
 use crate::recipe::Recipe;
@@ -75,17 +75,52 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     if v.is_finite() { v.clamp(lo, hi) } else { 0.0_f64.clamp(lo, hi) }
 }
 
+/// sRGB EOTF inverse: a display-referred value to linear light. `Analysis::p50`
+/// is a display (gamma-encoded) median, so an exposure ratio computed from it
+/// directly understates the correction in stops; decoding both the median and
+/// the key target to linear light first gives a true EV. This decodes the
+/// median itself, which is an approximation of the median of the linear
+/// values: the exact linear median is not stored on `Analysis` (that would
+/// need an `analysis.rs` change), so the two agree only up to that
+/// approximation.
+fn srgb_decode(c: f64) -> f64 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+/// The key target for a scene, in display units. Mirrors
+/// `analysis::key_target`; keep the two in sync.
+fn key_target(scene: Scene) -> f64 {
+    match scene {
+        Scene::Night => 0.22,
+        Scene::LowKey => 0.30,
+        Scene::HighKey => 0.60,
+        Scene::Backlit => 0.42,
+        _ => 0.45,
+    }
+}
+
 /// The Auto enhancement for this photo (what Auto at 100 % applies).
 pub fn enhance(a: &Analysis) -> DevelopSettings {
     let mut s = DevelopSettings::default();
-    s.light.exposure = clamp(a.exposure_correction, -2.0, 2.0);
+    // Exposure in linear light: decode the key target and the median, then
+    // take the log2 ratio (the clipped-highlights cap mirrors `analyze`).
+    let linear_p50 = srgb_decode(a.p50).max(1e-4);
+    let mut ev = (srgb_decode(key_target(a.scene)) / linear_p50).log2();
+    if a.clipped_highlights > 0.10 {
+        ev = ev.min(-0.25);
+    }
+    s.light.exposure = clamp(ev, -2.0, 2.0);
     s.light.contrast = clamp((0.22 - a.contrast) * 250.0, -40.0, 50.0);
     let range_bonus = if a.dynamic_range_ev > 10.0 { 15.0 } else { 0.0 };
     s.light.highlights = clamp(-a.clipped_highlights * 400.0 - range_bonus, -85.0, 0.0);
     s.light.shadows = clamp(a.clipped_shadows * 400.0 + range_bonus, 0.0, 85.0);
     s.light.whites = clamp(-a.clipped_highlights * 200.0, -50.0, 0.0);
-    s.light.blacks = clamp(a.clipped_shadows * 150.0 - 10.0, -30.0, 40.0);
+    s.light.blacks = clamp(a.clipped_shadows * 150.0, -30.0, 40.0);
     // Neutralise the measured cast: warm photos cool down, cool photos warm up.
+    // Setting temp/tint only takes effect with an explicit mode: the pipeline
+    // returns the as-shot white whenever the mode is `AsShot` (the default),
+    // ignoring temp/tint entirely.
+    s.wb.mode = WbMode::Custom;
     s.wb.temp = clamp(6500.0 - a.warmth * 1800.0, 3500.0, 10_000.0);
     s.wb.tint = clamp(-a.tint * 120.0, -100.0, 100.0);
     if a.scene != Scene::Monochrome {
@@ -357,6 +392,10 @@ mod tests {
         let a = Analysis::default();
         let s = enhance(&a);
         assert_eq!(s.light.exposure, 0.0);
+        // White balance changes render only with an explicit mode: the
+        // pipeline ignores temp/tint while the mode is AsShot.
+        assert_eq!(s.wb.mode, WbMode::Custom);
+        assert_eq!(s.wb.temp, 6500.0);
         assert!(s.light.contrast.is_finite() && s.effects.clarity.is_finite() && s.detail.sharpen_amount.is_finite());
         let advice = advise(&a);
         assert!(advice.summary.ends_with('.') && advice.summary.matches('.').count() == 1, "{}", advice.summary);
@@ -376,7 +415,11 @@ mod tests {
         a.clipped_highlights = 0.1;
         a.clipped_shadows = 0.1;
         let s = enhance(&a);
-        assert!(s.light.exposure > 0.0);
+        // Exposure is computed in linear light: decoding the 0.45 key and
+        // the 0.1 median gives a ratio that clamps at +2 EV, and the blacks
+        // recovery has no offset subtracted from it.
+        assert_eq!(s.light.exposure, 2.0);
+        assert_eq!(s.light.blacks, 15.0);
         assert!(s.light.highlights < 0.0 && s.light.shadows > 0.0);
         let advice = advise(&a);
         assert!(advice.summary.contains("clipped highlights"), "{}", advice.summary);

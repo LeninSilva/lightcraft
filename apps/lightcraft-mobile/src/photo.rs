@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use lightcraft_codecs::{ChromaSubsampling, DecodeOptions, EncodeImage, EncodeMeta};
+use lightcraft_codecs::{ChromaSubsampling, DecodeOptions, Decoded, EncodeImage, EncodeMeta};
 use lightcraft_develop::DevelopSettings;
 use lightcraft_geom::Orientation;
 use lightcraft_pipeline::{Quality, RenderRequest, Rendered, SourceInfo};
@@ -21,7 +21,24 @@ pub const PREVIEW_LONG_EDGE: u32 = 1600;
 pub const PROXY_LONG_EDGE: u32 = 384;
 /// Largest photo we open (pixels). Phones top out around 200 MP; a full-resolution render of that
 /// is ~2.4 GB of float pixels, past what a WebView's 4 GB wasm memory can hold twice.
+/// Opening and full-resolution export have separate caps: a photo between the export cap and
+/// this cap still opens for editing at preview size, but export refuses before allocating.
 pub const MAX_PIXELS: u64 = 120_000_000;
+/// Largest photo exported at full resolution (pixels). Above this, [`export_jpeg`] refuses
+/// before decoding, with a clear error, instead of allocating a render the WebView cannot hold.
+pub const EXPORT_MAX_PIXELS: u64 = 50_000_000;
+/// Worst-case live bytes per decoded pixel during export: the decoded float image (12) plus a
+/// second float image when orientation is not the identity (12). See [`RENDER_BYTES_PER_PIXEL`].
+const DECODE_BYTES_PER_PIXEL: u64 = 24;
+/// Worst-case live bytes per output pixel during export: render intermediates (sampled image,
+/// linear image, spatial planes, preparation buffers, ~32) plus the 8-bit output image (4).
+/// Together with [`DECODE_BYTES_PER_PIXEL`] this is ~60 bytes per pixel for an uncropped
+/// export: about 1.4 GB at 24 MP, 2.9 GB at 48 MP, 7.2 GB at the 120 MP open cap.
+const RENDER_BYTES_PER_PIXEL: u64 = 36;
+/// Peak working-memory budget for one export, in bytes: the 4 GB wasm heap this build runs in,
+/// less ~1 GB for the running app itself (wasm code, preview, proxy, library, JS). An export
+/// whose preflight estimate exceeds this is refused before any pixel buffer is allocated.
+const EXPORT_PEAK_BUDGET_BYTES: u64 = 3_000_000_000;
 /// Default JPEG quality of saved versions.
 pub const JPEG_QUALITY: u8 = 92;
 
@@ -67,6 +84,45 @@ fn oriented_dims(w: u32, h: u32, o: Orientation) -> (u32, u32) {
     if o.swaps_axes() { (h, w) } else { (w, h) }
 }
 
+/// [`Decoded::to_working`] on an owned decode: moves the decoded buffer instead of cloning it,
+/// converts in place when the source space needs a matrix, and flattens alpha in place. The
+/// arithmetic mirrors `lightcraft_codecs::to_working` exactly (f32 matrix, same alpha rule);
+/// only the allocation changes. The remaining `Decoded` fields (EXIF/XMP/ICC bytes) are dropped
+/// here, before orientation and render, instead of living until the end of the decode.
+fn into_working(decoded: Decoded) -> Rgb32f {
+    let Decoded { mut image, alpha, space, .. } = decoded;
+    if !space.is_working() {
+        let m = space.to_working().to_f32();
+        image.map_in_place(|p| mat_apply(&m, p));
+    }
+    if let Some(a) = alpha.as_ref().filter(|a| a.width == image.width && a.height == image.height) {
+        for (p, &av) in image.data.iter_mut().zip(&a.data) {
+            let av = av.clamp(0.0, 1.0);
+            *p = p.map(|c| c * av + (1.0 - av));
+        }
+    }
+    image
+}
+
+#[inline]
+fn mat_apply(m: &[[f32; 3]; 3], p: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2],
+        m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2],
+        m[2][0] * p[0] + m[2][1] * p[1] + m[2][2] * p[2],
+    ]
+}
+
+/// Worst-case live bytes for an export of `input_pixels` source pixels producing
+/// `output_pixels` output pixels. The decode term is charged on the source size (the full
+/// image is decoded even for a tight crop); the render term is charged on the output size
+/// (intermediates and the output image scale with what is rendered).
+fn export_peak_estimate(input_pixels: u64, output_pixels: u64) -> u64 {
+    input_pixels
+        .saturating_mul(DECODE_BYTES_PER_PIXEL)
+        .saturating_add(output_pixels.saturating_mul(RENDER_BYTES_PER_PIXEL))
+}
+
 /// Decode `bytes` fitting within `long_edge` (or at full size with `None`), oriented.
 fn decode_oriented(bytes: &[u8], long_edge: Option<u32>) -> Result<(Rgb32f, u32, u32), PhotoError> {
     let header = lightcraft_codecs::read_header(bytes)?;
@@ -82,7 +138,9 @@ fn decode_oriented(bytes: &[u8], long_edge: Option<u32>) -> Result<(Rgb32f, u32,
     let decoded = lightcraft_codecs::decode(bytes, opts)?;
     let o = Orientation::from_exif(decoded.orientation);
     let (w, h) = oriented_dims(decoded.source_width, decoded.source_height, o);
-    let image = decoded.to_working().oriented(o);
+    // `into_oriented` consumes the working image and returns it unchanged for the identity
+    // orientation (the common case); the borrowing `oriented` would clone it unconditionally.
+    let image = into_working(decoded).into_oriented(o);
     if image.width == 0 || image.height == 0 {
         return Err(PhotoError("This photo has no pixels.".into()));
     }
@@ -134,6 +192,32 @@ pub fn export_size(w: u32, h: u32, s: &DevelopSettings) -> (u32, u32) {
 /// the small proxy: the caller reports the failure instead of saving a
 /// low-resolution file the user believes is full resolution.
 pub fn export_jpeg(bytes: &[u8], s: &DevelopSettings, quality: u8) -> Result<Vec<u8>, PhotoError> {
+    // Preflight, before any pixel buffer is allocated: refuse an oversize export, and refuse
+    // one whose worst-case working set exceeds the export budget, with a clear error either
+    // way. The header read allocates nothing but the header; a photo refused here still opens
+    // for editing at preview size (the open cap is higher than the export cap).
+    let header = lightcraft_codecs::read_header(bytes)
+        .map_err(|e| PhotoError(format!("the original could not be decoded: {}", friendly_codec_error(&e))))?;
+    let input_pixels = u64::from(header.width).saturating_mul(u64::from(header.height));
+    if input_pixels > EXPORT_MAX_PIXELS {
+        return Err(PhotoError(format!(
+            "This photo is {} megapixels; LightCraft Mobile exports photos up to {} megapixels at full resolution. The photo still opens for editing at preview size.",
+            input_pixels / 1_000_000,
+            EXPORT_MAX_PIXELS / 1_000_000
+        )));
+    }
+    let o = Orientation::from_exif(header.orientation);
+    let (w, h) = oriented_dims(header.width, header.height, o);
+    let (ow, oh) = export_size(w, h, s);
+    let output_pixels = u64::from(ow).saturating_mul(u64::from(oh));
+    let estimate = export_peak_estimate(input_pixels, output_pixels);
+    if estimate > EXPORT_PEAK_BUDGET_BYTES {
+        return Err(PhotoError(format!(
+            "Exporting this photo would need about {:.1} GB of working memory, over the {:.1} GB this build allows. Try a tighter crop.",
+            estimate as f64 / 1_000_000_000.0,
+            EXPORT_PEAK_BUDGET_BYTES as f64 / 1_000_000_000.0
+        )));
+    }
     let (full, w, h) =
         decode_oriented(bytes, None).map_err(|e| PhotoError(format!("the original could not be decoded: {e}")))?;
     let (ow, oh) = export_size(w, h, s);
@@ -185,6 +269,27 @@ mod tests {
         let out = export_jpeg(&jpeg, &s, 90).unwrap();
         let again = Photo::open(&out).unwrap();
         assert_eq!((again.width, again.height), (640, 480));
+    }
+    #[test]
+    fn into_working_matches_to_working() {
+        let p = Photo::from_image(scene(64, 48));
+        let r = p.render(&DevelopSettings::default(), 64, 48, Quality::Full);
+        let jpeg = encode_jpeg(&r, 90).unwrap();
+        let opts = DecodeOptions { max_size: None, max_pixels: MAX_PIXELS };
+        let decoded = lightcraft_codecs::decode(&jpeg, opts).unwrap();
+        let expected = decoded.to_working();
+        let got = into_working(decoded);
+        assert_eq!((got.width, got.height), (expected.width, expected.height));
+        assert_eq!(got.data, expected.data);
+    }
+
+    #[test]
+    fn export_estimate_and_cap() {
+        assert_eq!(EXPORT_MAX_PIXELS, 50_000_000);
+        assert_eq!(export_peak_estimate(24_000_000, 24_000_000), 1_440_000_000);
+        assert_eq!(export_peak_estimate(48_000_000, 48_000_000), 2_880_000_000);
+        assert!(export_peak_estimate(EXPORT_MAX_PIXELS, EXPORT_MAX_PIXELS) <= EXPORT_PEAK_BUDGET_BYTES);
+        assert!(export_peak_estimate(MAX_PIXELS, MAX_PIXELS) > EXPORT_PEAK_BUDGET_BYTES);
     }
 }
 
