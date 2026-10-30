@@ -812,6 +812,8 @@ mod web_host {
         pending_pick.borrow_mut().replace(input.clone());
         let body_for_handler = body.clone();
         let pending_for_change = pending_pick.clone();
+        // Taken before `on_change` moves `shared`.
+        let shared_for_cancel = shared.clone();
         let on_change = Closure::<dyn FnMut()>::new(move || {
             // Claim the pending input: whichever handler runs first takes
             // it, and the other finds nothing and stays silent, so a pick
@@ -854,7 +856,6 @@ mod web_host {
         // pending-input guard alone cannot make that safe.
         let pending_for_cancel = pending_pick.clone();
         let body_for_cancel = body.clone();
-        let shared_for_cancel = shared.clone();
         let on_cancel = Closure::<dyn FnMut()>::new(move || {
             let Some(inp) = pending_for_cancel.borrow_mut().take() else {
                 return;

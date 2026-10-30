@@ -2402,6 +2402,10 @@ mod tests {
     #[test]
     fn stored_index_round_trips_through_loaded_events() {
         let (mut app, state) = app_with_test_host();
+        // Let the startup index load answer arrive first: until the library
+        // has loaded, index writes are deliberately held back.
+        run_frames(&egui::Context::default(), &mut app, 1);
+        assert!(app.library_loaded);
         open_scene(&mut app);
         app.toggle_keep(app.library.photos[0].id);
         // A fresh app reading the stored index sees the same library.

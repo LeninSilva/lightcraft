@@ -230,7 +230,7 @@ impl Backend {
                     JsFuture::from(h.create_writable_with_options(&opts)).await.map_err(err)?.unchecked_into();
                 let res = async { JsFuture::from(w.write_with_js_u8_array(&Uint8Array::from(data)).map_err(err)?).await.map_err(err) }.await;
                 match res {
-                    Ok(()) => JsFuture::from(w.close()).await.map(|_| ()).map_err(err),
+                    Ok(_) => JsFuture::from(w.close()).await.map(|_| ()).map_err(err),
                     Err(e) => {
                         let _ = JsFuture::from(w.abort()).await;
                         Err(e)
