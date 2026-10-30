@@ -57,6 +57,23 @@ use crate::recipe::{Aspect, History, Recipe, TuneGroup, TUNE_CONTROLS, compose};
 const MIN_TOUCH: f32 = 44.0;
 /// Height of the bottom tab bar, in points.
 const TAB_BAR_HEIGHT: f32 = 48.0;
+/// Width of a slider row's label, in points. Every slider row, enabled or
+/// disabled, uses this width so panels do not jump when a control is
+/// enabled or disabled.
+const SLIDER_LABEL_WIDTH: f32 = 104.0;
+/// Width of the top bar's back button, in points. "Library" at the default
+/// text size is wider than [`MIN_TOUCH`], so a 44pt button clips its
+/// label; 72pt fits the word with the button's padding.
+const BACK_BUTTON_WIDTH: f32 = 72.0;
+/// Width of a slider row's Reset button, in points. "Reset" at the
+/// default text size is wider than [`MIN_TOUCH`] with the button's
+/// padding, so a 44pt button clips it; 56pt fits the word.
+const RESET_BUTTON_WIDTH: f32 = 56.0;
+/// Below this available width the editor action row (Save version,
+/// Export, Share, Compare) uses two rows of two buttons instead of one
+/// row of four: four across leaves too little room for "Save version"
+/// at phone widths and the label clips.
+const ACTION_ROW_BREAKPOINT: f32 = 420.0;
 /// Long edge, in pixels, of the full preview and of a draft preview while dragging.
 const FULL_PREVIEW_EDGE: usize = 1024;
 const DRAFT_PREVIEW_EDGE: usize = 480;
@@ -152,6 +169,17 @@ struct VersionView {
     height: u32,
 }
 
+/// One button of the editor action row, in row order. The row is drawn
+/// from this list so the one-row and two-row shapes never reorder or
+/// drop a button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorAction {
+    SaveVersion,
+    Export,
+    Share,
+    Compare,
+}
+
 /// An action a library tile asked for, applied after the grid is drawn.
 #[derive(Clone, Copy, Debug)]
 enum GridAction {
@@ -179,6 +207,10 @@ pub struct App {
     status_error: bool,
     /// A slider was being dragged on the previous frame.
     dragging: bool,
+    /// Whether the photographic theme ([`photo_visuals`]) has been applied
+    /// to this context. Applied once, on the first frame, so the theme
+    /// does not re-apply (and re-request a repaint) every frame.
+    theme_applied: bool,
     /// The history key of the gesture in progress, if any.
     gesture_key: Option<String>,
     /// The "hold for original" button was held on the previous frame.
@@ -245,6 +277,7 @@ impl App {
             status: String::new(),
             status_error: false,
             dragging: false,
+            theme_applied: false,
             gesture_key: None,
             holding_compare: false,
             compare_latched: false,
@@ -271,6 +304,10 @@ impl App {
 
     /// Call once per frame with the root `Ui` (eframe's `App::ui`, or `Context::run_ui` in tests).
     pub fn frame(&mut self, ui: &mut egui::Ui) {
+        if !self.theme_applied {
+            self.theme_applied = true;
+            ui.ctx().set_visuals(photo_visuals());
+        }
         for event in self.host.poll() {
             self.handle_event(event);
         }
@@ -1320,6 +1357,131 @@ impl App {
     }
 }
 
+/// The photographic theme: dark neutral surfaces that recede so the
+/// photograph leads. One restrained warm accent, used only for selected
+/// controls (the active tab, the current look, a kept photo), and one
+/// corner radius everywhere, so the chrome reads as one quiet frame
+/// around the picture instead of a set of competing boxes. No new
+/// assets or fonts: this is the existing egui theme, recoloured.
+fn photo_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.window_fill = egui::Color32::from_rgb(0x14, 0x14, 0x14);
+    visuals.panel_fill = egui::Color32::from_rgb(0x1a, 0x1a, 0x1a);
+    visuals.faint_bg_color = egui::Color32::from_rgb(0x22, 0x22, 0x22);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(0x0d, 0x0d, 0x0d);
+    visuals.override_text_color = Some(egui::Color32::from_rgb(0xec, 0xec, 0xec));
+    visuals.weak_text_color = Some(egui::Color32::from_rgb(0x9c, 0x9c, 0x9c));
+    visuals.error_fg_color = egui::Color32::from_rgb(0xe0, 0x80, 0x80);
+    visuals.warn_fg_color = egui::Color32::from_rgb(0xd9, 0xb2, 0x5f);
+    visuals.window_corner_radius = egui::CornerRadius::ZERO;
+    visuals.menu_corner_radius = egui::CornerRadius::same(10);
+    visuals.window_stroke = egui::Stroke::NONE;
+    // The warm accent: selected controls only.
+    visuals.selection.bg_fill = egui::Color32::from_rgb(0x6e, 0x52, 0x1d);
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0xd9, 0xa4, 0x41));
+    let radius = egui::CornerRadius::same(10);
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(0x1a, 0x1a, 0x1a);
+    visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(0x1a, 0x1a, 0x1a);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x9c, 0x9c, 0x9c));
+    visuals.widgets.noninteractive.corner_radius = radius;
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x26, 0x26, 0x26);
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x26, 0x26, 0x26);
+    visuals.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x3a, 0x3a));
+    visuals.widgets.inactive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xe8, 0xe8, 0xe8));
+    visuals.widgets.inactive.corner_radius = radius;
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+    visuals.widgets.hovered.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x4a, 0x4a, 0x4a));
+    visuals.widgets.hovered.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xff, 0xff, 0xff));
+    visuals.widgets.hovered.corner_radius = radius;
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
+    visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
+    visuals.widgets.active.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x55, 0x55, 0x55));
+    visuals.widgets.active.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xff, 0xff, 0xff));
+    visuals.widgets.active.corner_radius = radius;
+    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+    visuals.widgets.open.weak_bg_fill = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+    visuals.widgets.open.corner_radius = radius;
+    visuals
+}
+
+/// A panel's title: one clear line saying what the panel does, in plain
+/// words, at a size below the library title and above body text, so the
+/// photo stays first in the hierarchy and each panel has one heading.
+fn panel_title(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(17.0).strong());
+}
+
+/// A subsection label inside a panel, smaller than a panel title.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(15.0).strong());
+}
+
+/// Top bar widths for an available width: the back button's fixed width
+/// and what is left for the photo name, floored so the name never
+/// collapses to nothing on a narrow screen. The row is back + gap +
+/// name + gap + Undo + gap + Redo, with 8pt gaps.
+fn top_bar_widths(avail_w: f32) -> (f32, f32) {
+    let name_w = (avail_w - BACK_BUTTON_WIDTH - 8.0 - MIN_TOUCH - 8.0 - MIN_TOUCH).max(40.0);
+    (BACK_BUTTON_WIDTH, name_w)
+}
+
+/// The editor action row: how many rows it needs, the button width in
+/// each row, and the row's total height including the gap between rows.
+/// One row of four on wide screens; two rows of two below
+/// [`ACTION_ROW_BREAKPOINT`], where four across clips "Save version".
+/// A button is never narrower than [`MIN_TOUCH`].
+fn action_layout(avail_w: f32) -> (usize, f32, f32) {
+    if avail_w < ACTION_ROW_BREAKPOINT {
+        let button_w = ((avail_w - 8.0) / 2.0).max(MIN_TOUCH);
+        (2, button_w, MIN_TOUCH * 2.0 + 8.0)
+    } else {
+        let button_w = ((avail_w - 24.0) / 4.0).max(MIN_TOUCH);
+        (1, button_w, MIN_TOUCH)
+    }
+}
+
+/// Split the height left after the editor's top chrome between the photo
+/// and the panel, reserving the tab bar and one gap. The panel takes
+/// 45% (96..340pt) and the photo takes the rest, floored at 60pt; on a
+/// short screen the panel shrinks instead of pushing the tab bar and
+/// panel off the bottom of the screen. Returns `(photo_h, panel_h)`.
+fn split_editor_area(avail_y: f32) -> (f32, f32) {
+    let chrome = TAB_BAR_HEIGHT + 8.0;
+    let panel_h = (avail_y * 0.45).clamp(96.0, 340.0);
+    let photo_h = (avail_y - chrome - panel_h).max(60.0);
+    let panel_h = (avail_y - chrome - photo_h).max(80.0);
+    (photo_h, panel_h)
+}
+
+/// Width of a slider's track inside a slider row, given the width left
+/// after the label. With a Reset button the track leaves room for the
+/// button and its gap; without one it takes all that is left. Floored
+/// at 60pt so the thumb stays usable on narrow screens.
+fn slider_width(avail_after_label: f32, has_reset: bool) -> f32 {
+    if has_reset {
+        (avail_after_label - RESET_BUTTON_WIDTH - 8.0).max(60.0)
+    } else {
+        avail_after_label.max(60.0)
+    }
+}
+
+/// Height of a library tile: the image (3:4 of the tile width) plus room
+/// for the name, the dimensions, and the button rows with the panel's
+/// 8pt spacing. The old extras (100/152) ran 4-8pt short, so the last
+/// button row crowded the next row; these leave the full room.
+fn tile_height(tile_w: f32, two_rows: bool) -> f32 {
+    tile_w * 0.75 + if two_rows { 160.0 } else { 108.0 }
+}
+
 /// Fit an image inside an area, keeping its aspect ratio.
 fn fit_size(area: egui::Vec2, image: [usize; 2]) -> egui::Vec2 {
     if area.x <= 0.0 || area.y <= 0.0 || image[0] == 0 || image[1] == 0 {
@@ -1344,9 +1506,9 @@ fn status_label(ui: &mut egui::Ui, app: &App) {
         return;
     }
     let color = if app.status_error {
-        egui::Color32::from_rgb(220, 80, 80)
+        egui::Color32::from_rgb(224, 128, 128)
     } else {
-        egui::Color32::from_rgb(120, 120, 120)
+        egui::Color32::from_rgb(140, 140, 140)
     };
     ui.label(egui::RichText::new(app.status.as_str()).small().color(color));
 }
@@ -1381,7 +1543,7 @@ impl App {
             }
         });
         ui.label(format!(
-            "Keeping {} photos, {} stored. Saved versions are always kept. Unkept photos beyond the {} most recent are let go.",
+            "Keeping {} photos, {} stored. Saved versions are always kept; unkept photos past the {} most recent are let go.",
             self.library.photos.len(),
             format_bytes(self.library.stored_bytes()),
             KEEP_RECENT
@@ -1397,7 +1559,7 @@ impl App {
                         "The saved library index could not be loaded. Your stored photos are still there.",
                     )
                     .small()
-                    .color(egui::Color32::from_rgb(220, 80, 80)),
+                    .color(egui::Color32::from_rgb(224, 128, 128)),
                 );
             } else {
                 ui.label(
@@ -1405,7 +1567,7 @@ impl App {
                         "The library index could not be saved. Your edits are kept in this session.",
                     )
                     .small()
-                    .color(egui::Color32::from_rgb(220, 80, 80)),
+                    .color(egui::Color32::from_rgb(224, 128, 128)),
                 );
             }
             if ui
@@ -1551,19 +1713,18 @@ impl App {
             None => return (false, false),
         };
         let ctx = ui.ctx().clone();
-        // Top bar: back, name, undo, redo.
+        // Top bar: back, name, undo, redo. The back button is wide
+        // enough for its word (see `BACK_BUTTON_WIDTH`); the name gets
+        // exactly what is left, via `top_bar_widths`.
         let top_w = ui.available_width();
+        let (back_w, name_w) = top_bar_widths(top_w);
         ui.horizontal(|ui| {
             if ui
-                .add_sized(egui::vec2(MIN_TOUCH, MIN_TOUCH), egui::Button::new("Library"))
+                .add_sized(egui::vec2(back_w, MIN_TOUCH), egui::Button::new("Library"))
                 .clicked()
             {
                 self.leave_editor();
             }
-            // Library 44 + gap 8 + Undo 44 + gap 8 + Redo 44 + gap 8:
-            // the horizontal layout inserts 8pt between each widget, so
-            // the name gets exactly what is left.
-            let name_w = (top_w - MIN_TOUCH - 8.0 - MIN_TOUCH - 8.0 - MIN_TOUCH - 8.0).max(40.0);
             ui.add_sized(
                 egui::vec2(name_w, MIN_TOUCH),
                 egui::Label::new(egui::RichText::new(name.as_str()).size(16.0)).truncate(),
@@ -1588,65 +1749,84 @@ impl App {
         }
         ui.label(egui::RichText::new(dims.as_str()).small());
         // Action row: save a version, export, share, hold for original.
+        // Two rows of two on narrow screens (see `action_layout`), so no
+        // label clips; one row of four when there is room for all four
+        // words. The row order never changes between the two shapes.
         let action_w = ui.available_width();
-        let button_w = ((action_w - 24.0) / 4.0).max(60.0);
+        let (rows, button_w, _) = action_layout(action_w);
+        let per_row = if rows == 2 { 2 } else { 4 };
         let mut holding = false;
-        ui.horizontal(|ui| {
-            if ui
-                .add_sized(egui::vec2(button_w, MIN_TOUCH), egui::Button::new("Save version"))
-                .clicked()
-            {
-                self.save_version();
-            }
-            if ui
-                .add_sized(egui::vec2(button_w, MIN_TOUCH), egui::Button::new("Export"))
-                .clicked()
-            {
-                self.export_to_device();
-            }
-            if ui
-                .add_sized(egui::vec2(button_w, MIN_TOUCH), egui::Button::new("Share"))
-                .clicked()
-            {
-                self.share();
-            }
-            let resp = ui.add_sized(
-                egui::vec2(button_w, MIN_TOUCH),
-                egui::Button::new("Compare").selected(self.compare_latched),
-            );
-            let pressed = resp.is_pointer_button_down_on();
-            if pressed && self.compare_press_ms.is_none() {
-                self.compare_press_ms = Some(self.host.now_ms());
-            }
-            if resp.clicked() {
-                // A quick tap latches compare on or off; a hold (300ms or
-                // more) compares only while held and leaves the latch
-                // alone, so releasing a hold never sticks compare on.
-                let elapsed = self.compare_press_ms.map(|start| self.host.now_ms() - start);
-                if elapsed.is_none_or(|ms| ms < 300.0) {
-                    self.compare_latched = !self.compare_latched;
+        for row in [EditorAction::SaveVersion, EditorAction::Export, EditorAction::Share, EditorAction::Compare]
+            .chunks(per_row)
+        {
+            ui.horizontal(|ui| {
+                for action in row {
+                    match action {
+                        EditorAction::SaveVersion => {
+                            if ui
+                                .add_sized(
+                                    egui::vec2(button_w, MIN_TOUCH),
+                                    egui::Button::new("Save version"),
+                                )
+                                .clicked()
+                            {
+                                self.save_version();
+                            }
+                        }
+                        EditorAction::Export => {
+                            if ui
+                                .add_sized(egui::vec2(button_w, MIN_TOUCH), egui::Button::new("Export"))
+                                .clicked()
+                            {
+                                self.export_to_device();
+                            }
+                        }
+                        EditorAction::Share => {
+                            if ui
+                                .add_sized(egui::vec2(button_w, MIN_TOUCH), egui::Button::new("Share"))
+                                .clicked()
+                            {
+                                self.share();
+                            }
+                        }
+                        EditorAction::Compare => {
+                            let resp = ui.add_sized(
+                                egui::vec2(button_w, MIN_TOUCH),
+                                egui::Button::new("Compare").selected(self.compare_latched),
+                            );
+                            let pressed = resp.is_pointer_button_down_on();
+                            if pressed && self.compare_press_ms.is_none() {
+                                self.compare_press_ms = Some(self.host.now_ms());
+                            }
+                            if resp.clicked() {
+                                // A quick tap latches compare on or off; a hold (300ms or
+                                // more) compares only while held and leaves the latch
+                                // alone, so releasing a hold never sticks compare on.
+                                let elapsed =
+                                    self.compare_press_ms.map(|start| self.host.now_ms() - start);
+                                if elapsed.is_none_or(|ms| ms < 300.0) {
+                                    self.compare_latched = !self.compare_latched;
+                                }
+                            }
+                            if !pressed {
+                                self.compare_press_ms = None;
+                            }
+                            holding = pressed || self.compare_latched;
+                        }
+                    }
                 }
-            }
-            if !pressed {
-                self.compare_press_ms = None;
-            }
-            holding = pressed || self.compare_latched;
-        });
-        ui.label("Save version keeps a full resolution JPEG in the app. Export saves a copy in the app cache; use Share to move it out to Photos or Files.");
+            });
+        }
+        ui.label("Save version keeps a full-resolution JPEG in the app. Export saves a copy; Share sends it out.");
         status_label(ui, self);
-        // Photo area, tab bar and panel share what is left. The panel is
-        // 40% of the height (clamped 120..340pt), and it never takes so
-        // much that less than 120pt is left for the photo after the top
-        // bar, action row, tab bar and spacing (`reserved`): that guard
-        // is what keeps the photo out of an 80pt sliver in landscape.
-        // Portrait 390x844: panel 337.6, photo 346.4. Landscape 844x390:
-        // panel 120, photo 110. (`reserved` still undercounts the label
-        // rows above the photo; the panel is scrollable, so any spill
-        // there clips inside the panel, not the photo.)
+        // What is left after the top chrome is split between the photo
+        // and the panel, reserving the tab bar (see `split_editor_area`).
+        // Measuring here, rather than from the top of the screen with a
+        // guessed reserved height, is what keeps the tab bar and panel
+        // on screen in landscape: the old guess undercounted the label
+        // rows above the photo and pushed the panel off the bottom.
         let avail = ui.available_size();
-        let reserved = MIN_TOUCH + MIN_TOUCH + TAB_BAR_HEIGHT + 24.0;
-        let panel_h = (avail.y * 0.40).clamp(120.0, 340.0).min((avail.y - reserved - 120.0).max(120.0));
-        let photo_h = (avail.y - reserved - panel_h).max(80.0);
+        let (photo_h, panel_h) = split_editor_area(avail.y);
         let preview = self.ensure_preview(&ctx, egui::vec2(avail.x, photo_h));
         ui.allocate_ui(egui::vec2(avail.x, photo_h), |ui| match preview {
             Some((id, size)) => {
@@ -1684,7 +1864,6 @@ impl App {
             }
         });
         // The active panel, scrollable inside its fixed height.
-        let panel_h = panel_h.max(120.0);
         ui.allocate_ui(egui::vec2(avail.x, panel_h), |ui| {
             egui::ScrollArea::vertical()
                 .max_height(panel_h)
@@ -1705,7 +1884,7 @@ impl App {
             Some(c) => (c.advice.clone(), c.analysis.scene.label().to_string()),
             None => return,
         };
-        ui.heading("Auto");
+        panel_title(ui, "Auto fix");
         ui.label(format!("Scene: {scene_label}."));
         ui.label(advice.summary.as_str());
         if advice.tags.is_empty() {
@@ -1721,7 +1900,7 @@ impl App {
             any_dragged,
             |r, v| r.auto = v,
         );
-        ui.label("Auto is an enhancement based on this photo. At 0 it is off. Auto strength scales only the Auto enhancement; a look, if one is picked, is then blended over it at the Look strength set in the Looks panel.");
+        ui.label("Auto enhances this photo. At 0 it is off. A look, if picked, blends over it at the Look strength.");
         if let Some(id) = advice.suggested_look {
             if let Some(found) = look(id) {
                 let name = found.name.to_string();
@@ -1737,7 +1916,7 @@ impl App {
                 }
             }
         }
-        ui.heading("Guidance");
+        section_label(ui, "Guidance");
         if advice.tips.is_empty() {
             ui.label(
                 "No one tap fixes for this photo yet. The guidance that suggests fixes is still being built, so this panel only shows the summary above. Auto, Looks and Tune still work.",
@@ -1765,7 +1944,7 @@ impl App {
     }
 
     fn looks_panel(&mut self, ui: &mut egui::Ui, any_dragged: &mut bool) {
-        ui.heading("Looks");
+        panel_title(ui, "Looks");
         ui.label("Looks adapt to each photo, so the same look lands differently on different photos.");
         if self.look_strength_enabled() {
             let strength = self.recipe.look_strength;
@@ -1789,8 +1968,8 @@ impl App {
             // when a look is picked.
             let mut value = self.recipe.look_strength;
             ui.horizontal(|ui| {
-                ui.add_sized(egui::vec2(104.0, MIN_TOUCH), egui::Label::new("Look strength"));
-                let slider_w = ui.available_width().max(60.0);
+                ui.add_sized(egui::vec2(SLIDER_LABEL_WIDTH, MIN_TOUCH), egui::Label::new("Look strength"));
+                let slider_w = slider_width(ui.available_width(), false);
                 ui.add_enabled_ui(false, |ui| {
                     ui.add_sized(
                         egui::vec2(slider_w, MIN_TOUCH),
@@ -1821,8 +2000,11 @@ impl App {
             let thumb = self.ensure_look_thumb(&ctx, found.id);
             let is_current = current_look.as_deref() == Some(found.id);
             // Tapping a look's thumbnail picks the look, like its Use button.
+            // The thumbnail fills its own row with a little breathing
+            // room: the old 150pt row centred an 84pt image and left
+            // 33pt of blank space above and below every look.
             let thumb_clicked = ui
-                .allocate_ui(egui::vec2(ui.available_width(), 150.0), |ui| match thumb {
+                .allocate_ui(egui::vec2(ui.available_width(), 96.0), |ui| match thumb {
                     Some((id, size)) => {
                         let fit = fit_size(egui::vec2(ui.available_width(), 84.0), size);
                         ui.centered_and_justified(|ui| {
@@ -1861,7 +2043,7 @@ impl App {
     }
 
     fn tune_panel(&mut self, ui: &mut egui::Ui, any_dragged: &mut bool) {
-        ui.heading("Tune");
+        panel_title(ui, "Fine tune");
         ui.label("Drag for a fast draft preview. Let go for the full preview.");
         let group_w = ui.available_width();
         ui.horizontal(|ui| {
@@ -1920,7 +2102,7 @@ impl App {
     }
 
     fn focus_panel(&mut self, ui: &mut egui::Ui, any_dragged: &mut bool) {
-        ui.heading("Focus");
+        panel_title(ui, "Focus on the subject");
         let (cx, cy, confidence) = match &self.current {
             Some(c) => (c.analysis.subject.cx, c.analysis.subject.cy, c.analysis.subject.confidence),
             None => return,
@@ -1973,8 +2155,8 @@ impl App {
             // panel does not jump when Focus is turned on.
             let mut value = self.recipe.focus.background;
             ui.horizontal(|ui| {
-                ui.add_sized(egui::vec2(104.0, MIN_TOUCH), egui::Label::new("Background"));
-                let slider_w = ui.available_width().max(60.0);
+                ui.add_sized(egui::vec2(SLIDER_LABEL_WIDTH, MIN_TOUCH), egui::Label::new("Background"));
+                let slider_w = slider_width(ui.available_width(), false);
                 ui.add_enabled_ui(false, |ui| {
                     ui.add_sized(
                         egui::vec2(slider_w, MIN_TOUCH),
@@ -2000,7 +2182,7 @@ impl App {
     }
 
     fn crop_panel(&mut self, ui: &mut egui::Ui, any_dragged: &mut bool) {
-        ui.heading("Crop");
+        panel_title(ui, "Crop and straighten");
         ui.label("Pick an aspect. The crop is placed around the subject when Smart crop is on.");
         let aspect_w = ui.available_width();
         let current_aspect = self.recipe.frame.aspect;
@@ -2109,11 +2291,11 @@ impl App {
         let mut value = current;
         ui.horizontal(|ui| {
             ui.add_sized(
-                egui::vec2(104.0, MIN_TOUCH),
+                egui::vec2(SLIDER_LABEL_WIDTH, MIN_TOUCH),
                 egui::Label::new(label),
             );
             let avail = ui.available_width();
-            let slider_w = if reset_to.is_some() { (avail - 52.0).max(60.0) } else { avail };
+            let slider_w = slider_width(avail, reset_to.is_some());
             let resp = ui.add_sized(
                 egui::vec2(slider_w, MIN_TOUCH),
                 egui::Slider::new(&mut value, min..=max).step_by(step),
@@ -2141,7 +2323,7 @@ impl App {
             }
             if let Some(reset) = reset_to {
                 if ui
-                    .add_sized(egui::vec2(MIN_TOUCH, MIN_TOUCH), egui::Button::new("Reset"))
+                    .add_sized(egui::vec2(RESET_BUTTON_WIDTH, MIN_TOUCH), egui::Button::new("Reset"))
                     .clicked()
                 {
                     let reset_key = format!("{key}:reset");
@@ -2173,7 +2355,7 @@ fn draw_photo_grid(
     let avail_w = ui.available_width();
     let (cols, two_rows) = grid_layout(avail_w);
     let tile_w = (avail_w - (cols as f32 - 1.0) * 8.0) / cols as f32;
-    let tile_h = tile_w * 0.75 + if two_rows { 152.0 } else { 100.0 };
+    let tile_h = tile_height(tile_w, two_rows);
     for row in tiles.chunks(cols) {
         ui.horizontal(|ui| {
             for (view, tex) in row {
@@ -2262,7 +2444,7 @@ fn draw_version_grid(
     let avail_w = ui.available_width();
     let (cols, two_rows) = grid_layout(avail_w);
     let tile_w = (avail_w - (cols as f32 - 1.0) * 8.0) / cols as f32;
-    let tile_h = tile_w * 0.75 + if two_rows { 152.0 } else { 100.0 };
+    let tile_h = tile_height(tile_w, two_rows);
     for row in tiles.chunks(cols) {
         ui.horizontal(|ui| {
             for (view, tex) in row {
@@ -2382,12 +2564,13 @@ mod tests {
     /// renderer, so clearing the texture delta is the explicit handling (the
     /// same pattern the desktop UI's headless tests use).
     fn run_frames(ctx: &egui::Context, app: &mut App, count: usize) {
+        run_frames_sized(ctx, app, count, 390.0, 844.0);
+    }
+
+    fn run_frames_sized(ctx: &egui::Context, app: &mut App, count: usize, w: f32, h: f32) {
         for _ in 0..count {
             let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(390.0, 844.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.frame(ui));
@@ -2665,6 +2848,83 @@ mod tests {
         assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(2048), "2 KB");
         assert_eq!(format_bytes(3_145_728), "3.0 MB");
+    }
+
+    #[test]
+    fn layout_helpers_keep_controls_on_screen() {
+        // Top bar: the back button fits "Library"; the name gets the
+        // rest, floored so it never collapses on a narrow screen.
+        assert_eq!(top_bar_widths(390.0), (72.0, 214.0));
+        assert_eq!(top_bar_widths(200.0).1, 40.0);
+        // Action row: two rows below the breakpoint, one row above; the
+        // two-row shape is taller by one button plus the gap.
+        assert_eq!(action_layout(390.0), (2, 191.0, 96.0));
+        assert_eq!(action_layout(320.0), (2, 156.0, 96.0));
+        assert_eq!(action_layout(420.0), (1, 99.0, 44.0));
+        assert_eq!(action_layout(500.0), (1, 119.0, 44.0));
+        // Editor split: photo + tab bar + panel exactly fill the height
+        // left after the top chrome; the photo never drops below 60pt
+        // and the panel never below 80pt.
+        for avail in [200.0, 300.0, 500.0, 700.0] {
+            let (photo, panel) = split_editor_area(avail);
+            assert!(
+                (photo + TAB_BAR_HEIGHT + 8.0 + panel - avail).abs() < 0.001,
+                "avail {avail}: photo {photo} panel {panel}"
+            );
+            assert!(photo >= 60.0);
+            assert!(panel >= 80.0);
+        }
+        assert_eq!(split_editor_area(500.0), (219.0, 225.0));
+        // Slider track: room for the Reset button and its gap, floored
+        // so the thumb stays usable.
+        assert_eq!(slider_width(226.0, true), 162.0);
+        assert_eq!(slider_width(80.0, true), 60.0);
+        assert_eq!(slider_width(80.0, false), 80.0);
+        // Grid: two columns on phones (one button row fits a 191pt
+        // tile), two button rows only on very narrow screens, four
+        // columns on wide screens. Tile height leaves room for the
+        // name, dimensions and button rows.
+        assert_eq!(grid_layout(390.0), (2, false));
+        assert_eq!(grid_layout(300.0), (2, true));
+        assert_eq!(grid_layout(800.0), (4, false));
+        assert_eq!(tile_height(191.0, true), 191.0 * 0.75 + 160.0);
+        assert_eq!(tile_height(194.0, false), 194.0 * 0.75 + 108.0);
+        // The theme is dark and quiet: near-black window, soft text.
+        let visuals = photo_visuals();
+        assert!(visuals.dark_mode);
+        assert_eq!(visuals.window_fill, egui::Color32::from_rgb(0x14, 0x14, 0x14));
+        assert_eq!(
+            visuals.widgets.inactive.corner_radius,
+            egui::CornerRadius::same(10)
+        );
+    }
+
+    #[test]
+    fn narrow_and_landscape_frames_without_panic() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(Box::new(MemoryHost::default()));
+        // Let the startup index load answer arrive before picking a
+        // photo, as `stored_index_round_trips_through_loaded_events`
+        // does: a photo added before the library loads is wiped when
+        // the empty stored index is adopted.
+        run_frames_sized(&ctx, &mut app, 1, 390.0, 844.0);
+        open_scene(&mut app);
+        // Narrow phone and landscape: every tab, both grid tabs, and the
+        // library screen must frame without panic and stay in the
+        // editor/library screens they belong to.
+        for (w, h) in [(320.0, 568.0), (844.0, 390.0), (390.0, 844.0)] {
+            for tab in [Tab::Auto, Tab::Looks, Tab::Tune, Tab::Focus, Tab::Crop] {
+                app.tab = tab;
+                run_frames_sized(&ctx, &mut app, 2, w, h);
+            }
+            assert_eq!(app.screen, Screen::Editor);
+            app.leave_editor();
+            run_frames_sized(&ctx, &mut app, 2, w, h);
+            assert_eq!(app.screen, Screen::Library);
+            app.request_open_photo(app.library.photos[0].id);
+            run_frames_sized(&ctx, &mut app, 2, w, h);
+        }
+        assert_eq!(app.screen, Screen::Editor);
     }
 
     #[test]
