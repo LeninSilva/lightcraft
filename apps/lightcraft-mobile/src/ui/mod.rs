@@ -674,6 +674,10 @@ impl App {
 
     fn undo(&mut self) {
         let current = self.recipe.clone();
+        // A gesture left open by a drag that ended without a stop event must
+        // not survive the undo: the next drag would reuse its key and skip
+        // recording, losing the undo step for that drag (W11).
+        self.gesture_key = None;
         if let Some(prev) = self.history.undo(&current) {
             self.recipe = prev;
             self.dirty_library = true;
@@ -685,6 +689,7 @@ impl App {
 
     fn redo(&mut self) {
         let current = self.recipe.clone();
+        self.gesture_key = None;
         if let Some(next) = self.history.redo(&current) {
             self.recipe = next;
             self.dirty_library = true;
@@ -1311,7 +1316,7 @@ impl App {
             any_dragged,
             |r, v| r.auto = v,
         );
-        ui.label("Auto is an enhancement based on this photo. At 0 it is off.");
+        ui.label("Auto is an enhancement based on this photo. At 0 it is off. Auto strength scales only the Auto enhancement; a look, if one is picked, is then blended over it at the Look strength set in the Looks panel.");
         if let Some(id) = advice.suggested_look {
             if let Some(found) = look(id) {
                 let name = found.name.to_string();
@@ -1381,6 +1386,7 @@ impl App {
             );
             ui.label("Pick a look first, then set its strength.");
         }
+        ui.label("Look strength blends the selected look over the Auto result. Thumbnails show each look at full strength; the preview uses the Look strength above.");
         let ctx = ui.ctx().clone();
         // The Original tile plus one tile per look.
         let current_look = self.recipe.look.clone();
@@ -1696,7 +1702,9 @@ impl App {
                     self.history.seal();
                     self.gesture_key = None;
                 }
-            } else if resp.drag_stopped() {
+            } else if resp.drag_stopped() && self.gesture_key.as_deref() == Some(key) {
+                // Only this slider's own open gesture ends here: a stop event
+                // from another control must not seal a gesture in progress.
                 self.history.seal();
                 self.gesture_key = None;
             }

@@ -208,6 +208,13 @@ impl Backend {
                 if v.is_undefined() || v.is_null() {
                     return Ok(None);
                 }
+                // Only byte arrays are ever written here. A stored value of
+                // any other type (tampered store, another writer) must be an
+                // error, never a `Uint8Array` construction that throws inside
+                // the async task and hangs the request with no answer.
+                if v.dyn_ref::<Uint8Array>().is_none() && v.dyn_ref::<js_sys::ArrayBuffer>().is_none() {
+                    return Err("stored value is not a byte array".to_string());
+                }
                 Ok(Some(Uint8Array::new(&v).to_vec()))
             }
         }

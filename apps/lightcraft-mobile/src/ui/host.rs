@@ -2,7 +2,10 @@
 //! load blobs, save a file where the user can find it, share) is a [`HostRequest`]; answers come
 //! back later as [`HostEvent`]s the app drains every frame. [`WebHost`] implements it with the
 //! browser (file picker, OPFS with an IndexedDB fallback, download export, Web Share
-//! with a download fallback; see [`crate::ui::storage`]). Tests use [`MemoryHost`].
+//! with a download fallback; see [`crate::ui::storage`]). Inside a Capacitor shell
+//! (the phone app) saving and sharing instead go through the Capacitor
+//! Filesystem and Share plugins, because Android WebView implements
+//! neither the anchor download nor `navigator.share`. Tests use [`MemoryHost`].
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -119,6 +122,55 @@ fn share_failure_message(error_name: &str, fallback: &str) -> String {
     }
 }
 
+/// Base64 (standard alphabet, padded) encoding of `data`, for the Capacitor
+/// Filesystem plugin, which takes binary file contents as a base64 string.
+/// Pure, so it is tested natively. Implemented here rather than gained as a
+/// dependency for a thirty-line encoder.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Whether a plugin error's name or message says the user cancelled, in
+/// either spelling the bridges use ("AbortError", "Share canceled").
+/// Pure, so it is tested natively.
+fn is_cancelled(name: &str, message: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    name.contains("cancel") || name.contains("abort") || message.contains("cancel")
+}
+
+/// Human-readable text for a plugin error: its message, else its name,
+/// else a fallback. Pure, so it is tested natively.
+fn plugin_error_text(name: &str, message: &str) -> String {
+    if !message.is_empty() {
+        message.to_string()
+    } else if !name.is_empty() {
+        name.to_string()
+    } else {
+        "unknown error".to_string()
+    }
+}
+
 /// A download name with no directory parts: the name the app asks to save, stripped of any
 /// `/` or `\` prefix, so a hostile or mistaken name cannot escape the download folder.
 /// Testable natively; used by [`WebHost`]'s download export.
@@ -129,7 +181,7 @@ fn safe_file_name(name: &str) -> &str {
 
 #[cfg(target_arch = "wasm32")]
 mod web_host {
-    use super::{Host, HostEvent, HostRequest, safe_file_name, share_failure_message, should_fallback_to_download};
+    use super::{Host, HostEvent, HostRequest, base64_encode, is_cancelled, plugin_error_text, safe_file_name, share_failure_message, should_fallback_to_download};
     use crate::ui::storage::Backend;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -162,7 +214,11 @@ mod web_host {
     }
 
     /// The browser host: the file picker, OPFS/IndexedDB storage, download export, and
-    /// the Web Share API with a download fallback.
+    /// the Web Share API with a download fallback. Inside a Capacitor shell, saving
+    /// and sharing go through the Capacitor Filesystem and Share plugins instead:
+    /// Android WebView implements neither the anchor download nor `navigator.share`,
+    /// so those browser paths must never be used there, and no success is reported
+    /// until the plugin call actually succeeds.
     /// Storage requests are queued and run by one sequential worker, in queue
     /// order, so a stale index write can never land after a newer one; requests
     /// sent before the backend opens wait in the same queue. If the backend
@@ -170,11 +226,17 @@ mod web_host {
     /// [`HostEvent::Failed`]. `Share` opens the system share sheet when the browser
     /// supports sharing files; otherwise it downloads the file instead and answers
     /// [`HostEvent::Saved`], so the user still gets the file.
+    // How long storage may take to open before the app reports the failure
+    // instead of showing "Loading your library." forever (M4).
+    const OPEN_TIMEOUT_MS: f64 = 30_000.0;
+
     pub struct WebHost {
         shared: Shared,
         backend: Rc<RefCell<BackendState>>,
         pending: Rc<RefCell<VecDeque<HostRequest>>>,
         pumping: Rc<Cell<bool>>,
+        /// Wall-clock time, in milliseconds, when opening started.
+        opened_at_ms: f64,
     }
 
     impl WebHost {
@@ -184,25 +246,34 @@ mod web_host {
             let backend: Rc<RefCell<BackendState>> = Rc::new(RefCell::new(BackendState::Opening));
             let pending: Rc<RefCell<VecDeque<HostRequest>>> = Rc::new(RefCell::new(VecDeque::new()));
             let pumping: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            let opened_at_ms = js_sys::Date::now();
             let (b2, p2, s2, pump2) = (backend.clone(), pending.clone(), shared.clone(), pumping.clone());
             wasm_bindgen_futures::spawn_local(async move {
                 match Backend::open().await {
                     Ok(b) => {
                         log::info!("lightcraft-mobile: storage backend {}", b.kind());
-                        *b2.borrow_mut() = BackendState::Ready(b);
-                        kick_worker(&b2, &p2, &s2, &pump2);
+                        // Only an opener that is still pending may resolve:
+                        // a timed-out open must not resurrect the backend.
+                        let still_opening = matches!(*b2.borrow(), BackendState::Opening);
+                        if still_opening {
+                            *b2.borrow_mut() = BackendState::Ready(b);
+                            kick_worker(&b2, &p2, &s2, &pump2);
+                        }
                     }
                     Err(e) => {
                         log::warn!("lightcraft-mobile: storage unavailable: {e}");
-                        *b2.borrow_mut() = BackendState::Failed(e.clone());
-                        for req in p2.borrow_mut().drain(..) {
-                            let _ = req;
-                            s2.push(HostEvent::Failed { what: "storage".into(), message: e.clone() });
+                        let still_opening = matches!(*b2.borrow(), BackendState::Opening);
+                        if still_opening {
+                            *b2.borrow_mut() = BackendState::Failed(e.clone());
+                            for req in p2.borrow_mut().drain(..) {
+                                let _ = req;
+                                s2.push(HostEvent::Failed { what: "storage".into(), message: e.clone() });
+                            }
                         }
                     }
                 }
             });
-            WebHost { shared, backend, pending, pumping }
+            WebHost { shared, backend, pending, pumping, opened_at_ms }
         }
 
         fn storage(&mut self, request: HostRequest) {
@@ -277,11 +348,13 @@ mod web_host {
                 HostRequest::PickPhoto => pick_photo(self.shared.clone()),
                 HostRequest::Put { .. } | HostRequest::Get { .. } | HostRequest::Delete { .. } => self.storage(request),
                 HostRequest::SaveToDevice { name, bytes } => {
-                    let clean = safe_file_name(&name).to_string();
-                    match download(&name, &bytes) {
-                        Ok(()) => self.shared.push(HostEvent::Saved { name: clean.clone(), location: format!("Downloads/{clean}") }),
-                        Err(message) => self.shared.push(HostEvent::Failed { what: "save".into(), message }),
-                    }
+                    // Saving is asynchronous in the Capacitor shell (a plugin
+                    // promise), so it runs as a task like Share, and answers
+                    // only from the plugin's real result.
+                    let shared = self.shared.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        save_to_device(shared, name, bytes).await;
+                    });
                 }
                 HostRequest::Share { name, bytes } => {
                     let shared = self.shared.clone();
@@ -293,6 +366,20 @@ mod web_host {
         }
 
         fn poll(&mut self) -> Vec<HostEvent> {
+            // Opening has no async timeout of its own (no timer plumbing in
+            // this crate), so the frame loop watches it: if storage still has
+            // not opened after OPEN_TIMEOUT_MS, fail it visibly instead of
+            // leaving the library loading forever. A late opener is ignored
+            // by the still-opening guard in `new`.
+            let still_opening = matches!(*self.backend.borrow(), BackendState::Opening);
+            if still_opening && js_sys::Date::now() - self.opened_at_ms > OPEN_TIMEOUT_MS {
+                let message = "storage did not open in time".to_string();
+                *self.backend.borrow_mut() = BackendState::Failed(message.clone());
+                for _ in self.pending.borrow_mut().drain(..) {
+                    self.shared.push(HostEvent::Failed { what: "storage".into(), message: message.clone() });
+                }
+                self.shared.push(HostEvent::Failed { what: "storage".into(), message });
+            }
             self.shared.events.borrow_mut().drain(..).collect()
         }
     }
@@ -315,6 +402,198 @@ mod web_host {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The (`name`, `message`) properties of a JS rejection value, or empty
+    /// strings when it has neither (a bare string rejection is handled by
+    /// [`plugin_error`], which checks that first).
+    fn js_error_parts(e: &JsValue) -> (String, String) {
+        let name = Reflect::get(e, &"name".into()).ok().and_then(|n| n.as_string()).unwrap_or_default();
+        let message = Reflect::get(e, &"message".into()).ok().and_then(|m| m.as_string()).unwrap_or_default();
+        (name, message)
+    }
+
+    /// Human-readable text for a JS rejection value: a bare string rejection
+    /// as-is, else its message, else its name, else a fallback.
+    fn plugin_error(e: &JsValue) -> String {
+        if let Some(s) = e.as_string() {
+            if !s.is_empty() {
+                return s;
+            }
+        }
+        let (name, message) = js_error_parts(e);
+        plugin_error_text(&name, &message)
+    }
+
+    /// Whether this page runs inside a Capacitor shell at all: the native
+    /// bridge injects `window.Capacitor`. This says nothing about which
+    /// plugins are installed; callers must check the plugin they need with
+    /// [`capacitor_plugin`].
+    fn capacitor_present() -> bool {
+        let Some(window) = web_sys::window() else {
+            return false;
+        };
+        let window_value: JsValue = window.into();
+        let Ok(capacitor) = Reflect::get(&window_value, &JsValue::from_str("Capacitor")) else {
+            return false;
+        };
+        !capacitor.is_undefined() && !capacitor.is_null()
+    }
+
+    /// The Capacitor plugin object named `name`, when this page runs inside a
+    /// Capacitor shell that installed that plugin and the named method is a
+    /// function, or `None` otherwise. Deliberately strict: a Capacitor shell
+    /// without the plugin installed (the APK workflow installs only
+    /// core/cli/android/assets today) reports `None`, and callers must say
+    /// the plugin is missing instead of claiming success through a path
+    /// that does nothing in a WebView.
+    fn capacitor_plugin(name: &str, method: &str) -> Option<JsValue> {
+        let window = web_sys::window()?;
+        let window_value: JsValue = window.into();
+        let capacitor = Reflect::get(&window_value, &JsValue::from_str("Capacitor")).ok()?;
+        if capacitor.is_undefined() || capacitor.is_null() {
+            return None;
+        }
+        let plugins = Reflect::get(&capacitor, &JsValue::from_str("Plugins")).ok()?;
+        if plugins.is_undefined() || plugins.is_null() {
+            return None;
+        }
+        let plugin = Reflect::get(&plugins, &JsValue::from_str(name)).ok()?;
+        if plugin.is_undefined() || plugin.is_null() {
+            return None;
+        }
+        let func = Reflect::get(&plugin, &JsValue::from_str(method)).ok()?;
+        if !func.is_function() {
+            return None;
+        }
+        Some(plugin)
+    }
+
+    /// Set one string property on a JS options object. Errors (a non-object,
+    /// a frozen object) surface as a message instead of panicking.
+    fn set_opt(obj: &js_sys::Object, key: &str, value: &str) -> Result<(), String> {
+        Reflect::set(obj.as_ref(), &JsValue::from_str(key), &JsValue::from_str(value))
+            .map(|_| ())
+            .map_err(|e| plugin_error(&e))
+    }
+
+    /// Call `method` on a Capacitor plugin object with one options object,
+    /// awaiting the returned promise. Returns the promise's resolved value,
+    /// or its rejection value.
+    async fn call_plugin(plugin: &JsValue, method: &str, args: &js_sys::Object) -> Result<JsValue, JsValue> {
+        let func = Reflect::get(plugin, &JsValue::from_str(method))?;
+        if !func.is_function() {
+            return Err(JsValue::from_str("plugin method is not a function"));
+        }
+        let func: js_sys::Function = func.unchecked_into();
+        let args_value: &JsValue = args.as_ref();
+        let result = func.call1(plugin, args_value)?;
+        // `Promise.resolve` adopts an already-a-promise result and wraps
+        // anything else, so a plugin that returns a plain value is handled
+        // the same way as one that returns a promise.
+        let promise = js_sys::Promise::resolve(&result);
+        JsFuture::from(promise).await
+    }
+
+    /// Write `bytes` to the Capacitor Filesystem Cache directory and return
+    /// the file URI the plugin reports, falling back to `getUri` when the
+    /// write result carries none. The Cache directory needs no storage
+    /// permission, so this succeeds where writing to shared storage would
+    /// fail under scoped storage; the file is real and shareable, but it
+    /// does NOT land in the phone's Downloads folder or Photos, and the
+    /// returned URI is reported as the location so the UI never claims
+    /// otherwise. Err carries a human-readable message.
+    async fn capacitor_write_file(name: &str, bytes: &[u8]) -> Result<String, String> {
+        let plugin = capacitor_plugin("Filesystem", "writeFile")
+            .ok_or_else(|| "the Filesystem plugin is not installed in this build".to_string())?;
+        let clean = safe_file_name(name).to_string();
+        let path = format!("lightcraft/{clean}");
+        let opts = js_sys::Object::new();
+        set_opt(&opts, "path", &path)?;
+        set_opt(&opts, "data", &base64_encode(bytes))?;
+        set_opt(&opts, "directory", "CACHE")?;
+        Reflect::set(opts.as_ref(), &JsValue::from_str("recursive"), &JsValue::from_bool(true))
+            .map(|_| ())
+            .map_err(|e| plugin_error(&e))?;
+        let result = call_plugin(&plugin, "writeFile", &opts).await.map_err(|e| plugin_error(&e))?;
+        if let Some(uri) = Reflect::get(&result, &JsValue::from_str("uri")).ok().and_then(|u| u.as_string()) {
+            if !uri.is_empty() {
+                return Ok(uri);
+            }
+        }
+        let uri_opts = js_sys::Object::new();
+        set_opt(&uri_opts, "path", &path)?;
+        set_opt(&uri_opts, "directory", "CACHE")?;
+        let result = call_plugin(&plugin, "getUri", &uri_opts).await.map_err(|e| plugin_error(&e))?;
+        Reflect::get(&result, &JsValue::from_str("uri"))
+            .ok()
+            .and_then(|u| u.as_string())
+            .filter(|uri| !uri.is_empty())
+            .ok_or_else(|| "Filesystem write succeeded but returned no file URI".to_string())
+    }
+
+    /// Save `bytes` where the user can get at them, answering only from the
+    /// real result. In a Capacitor shell the file is written with the
+    /// Filesystem plugin (see [`capacitor_write_file`]); in a browser the
+    /// existing anchor download is kept unchanged.
+    async fn save_to_device(shared: Shared, name: String, bytes: Vec<u8>) {
+        if capacitor_present() {
+            match capacitor_write_file(&name, &bytes).await {
+                Ok(uri) => shared.push(HostEvent::Saved { name: safe_file_name(&name).to_string(), location: uri }),
+                Err(message) => shared.push(HostEvent::Failed { what: "save".into(), message }),
+            }
+            return;
+        }
+        download_and_answer(&shared, &name, &bytes);
+    }
+
+    /// Share `bytes` through the Capacitor Share plugin: write the file
+    /// with Filesystem first, then open the system share sheet with the
+    /// file URI. Only the plugin's result answers: a resolved share is
+    /// `Saved`, a cancelled share is "Sharing was cancelled.", any other
+    /// rejection is `Failed` with the plugin's reason. There is no
+    /// download fallback here: the anchor download does not work in a
+    /// WebView, so falling back to it would repeat the false-success bug.
+    /// A file written before a missing Share plugin is left in the Cache
+    /// directory; it is harmless, and the failure says the Share plugin
+    /// is missing.
+    async fn capacitor_share(shared: Shared, name: String, bytes: Vec<u8>) {
+        let clean = safe_file_name(&name).to_string();
+        let uri = match capacitor_write_file(&name, &bytes).await {
+            Ok(uri) => uri,
+            Err(message) => {
+                shared.push(HostEvent::Failed { what: "share".into(), message });
+                return;
+            }
+        };
+        let Some(plugin) = capacitor_plugin("Share", "share") else {
+            shared.push(HostEvent::Failed {
+                what: "share".into(),
+                message: "the Share plugin is not installed in this build".to_string(),
+            });
+            return;
+        };
+        let opts = js_sys::Object::new();
+        let files = js_sys::Array::of1(&JsValue::from_str(&uri));
+        if Reflect::set(opts.as_ref(), &JsValue::from_str("files"), files.as_ref()).is_err() {
+            shared.push(HostEvent::Failed { what: "share".into(), message: "could not build the share request".to_string() });
+            return;
+        }
+        if Reflect::set(opts.as_ref(), &JsValue::from_str("dialogTitle"), &JsValue::from_str("Share photo")).is_err() {
+            shared.push(HostEvent::Failed { what: "share".into(), message: "could not build the share request".to_string() });
+            return;
+        }
+        match call_plugin(&plugin, "share", &opts).await {
+            Ok(_) => shared.push(HostEvent::Saved { name: clean, location: "the share sheet".into() }),
+            Err(e) => {
+                let (error_name, message) = js_error_parts(&e);
+                if is_cancelled(&error_name, &message) {
+                    shared.push(HostEvent::Failed { what: "share".into(), message: "Sharing was cancelled.".to_string() });
+                } else {
+                    shared.push(HostEvent::Failed { what: "share".into(), message: format!("Sharing failed: {}", plugin_error(&e)) });
+                }
+            }
         }
     }
 
@@ -348,8 +627,15 @@ mod web_host {
     /// Share `bytes` with the system share sheet (Web Share API, files). When the browser
     /// has no share API or cannot share files, the file is downloaded instead and the
     /// answer is `Saved`, so the user still gets the file. A share the user cancels, or
-    /// one the browser rejects, answers `Failed` with the real reason.
+    /// one the browser rejects, answers `Failed` with the real reason. Inside a
+    /// Capacitor shell this function is never reached: [`capacitor_share`] runs
+    /// instead, because neither `navigator.share` nor the anchor download works
+    /// in an Android WebView.
     async fn share_photo(shared: Shared, name: String, bytes: Vec<u8>) {
+        if capacitor_present() {
+            capacitor_share(shared, name, bytes).await;
+            return;
+        }
         let Some(window) = web_sys::window() else {
             download_and_answer(&shared, &name, &bytes);
             return;
@@ -411,9 +697,18 @@ mod web_host {
     /// app simply waits (the same limitation as the desktop web app's picker); the app no
     /// longer blocks Add photo on a pending pick, so a cancelled pick costs one more tap.
     /// Every failure path here answers `PickCancelled`, so the app is never left
-    /// waiting on a picker that cannot open.
+    /// waiting on a picker that cannot open. The input is appended to the document
+    /// body, visually hidden, before it is clicked: a detached input is enough in
+    /// desktop Chrome, but in an Android WebView the native file chooser is driven
+    /// for inputs in the page, and a detached input may open nothing at all. The
+    /// input is removed from the body in the change handler, on every path
+    /// (picked, empty, or no files), so hidden inputs never accumulate.
     fn pick_photo(shared: Shared) {
-        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        let Some(window) = web_sys::window() else {
+            shared.push(HostEvent::PickCancelled);
+            return;
+        };
+        let Some(doc) = window.document() else {
             shared.push(HostEvent::PickCancelled);
             return;
         };
@@ -424,8 +719,23 @@ mod web_host {
         input.set_type("file");
         input.set_multiple(false);
         input.set_accept("image/*,.jpg,.jpeg,.png,.webp,.tif,.tiff,.dng,.cr2,.cr3,.nef,.arw,.orf,.rw2,.raf,.pef,.heic,.heif,.avif");
+        let Some(body) = doc.body() else {
+            shared.push(HostEvent::PickCancelled);
+            return;
+        };
+        let input_node: &web_sys::Node = input.unchecked_ref();
+        if input.set_attribute("style", "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;").is_err()
+            || body.append_child(input_node).is_err()
+        {
+            shared.push(HostEvent::PickCancelled);
+            return;
+        }
         let inp = input.clone();
+        let body_for_handler = body.clone();
         let on_change = Closure::<dyn FnMut()>::new(move || {
+            // Remove the hidden input first: every path below answers, and
+            // the element must not stay in the document either way.
+            let _ = body_for_handler.remove_child(inp.unchecked_ref());
             let Some(files) = inp.files() else {
                 shared.push(HostEvent::PickCancelled);
                 return;
@@ -452,8 +762,9 @@ mod web_host {
     }
 
     /// Offer `bytes` as a browser download named `name` (mirrors the desktop web app's
-    /// export). In the Capacitor WebView this lands in the phone's Downloads folder; whether
-    /// the WebView surfaces the download is a phone-test item (see PLATFORM-NOTES.md).
+    /// export). Browser-only: in the Capacitor shell, saving goes through the
+    /// Filesystem plugin instead (see [`save_to_device`]), because Android
+    /// WebView does not honor the anchor `download` attribute.
     fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
         let e = |e: JsValue| format!("download failed: {e:?}");
         let clean = safe_file_name(name);
@@ -507,6 +818,27 @@ mod tests {
         assert_eq!(share_failure_message("AbortError", "Sharing failed."), "Sharing was cancelled.");
         assert_eq!(share_failure_message("NotAllowedError", "Sharing failed."), "Sharing failed (NotAllowedError).");
         assert_eq!(share_failure_message("", "Sharing is not available in this browser."), "Sharing is not available in this browser.");
+    }
+
+    #[test]
+    fn base64_encode_matches_standard_vectors() {
+        assert_eq!(base64_encode(&[]), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(&[0, 255, 254]), "AP/+");
+        assert_eq!(base64_encode(&[0, 0, 0]), "AAAA");
+    }
+
+    #[test]
+    fn cancelled_plugin_errors_are_recognised() {
+        assert!(is_cancelled("AbortError", ""));
+        assert!(is_cancelled("Error", "Share canceled by user"));
+        assert!(is_cancelled("Error", "user cancelled"));
+        assert!(!is_cancelled("NotAllowedError", "permission denied"));
+        assert_eq!(plugin_error_text("Error", "no space left"), "no space left");
+        assert_eq!(plugin_error_text("Error", ""), "Error");
+        assert_eq!(plugin_error_text("", ""), "unknown error");
     }
 
     #[test]
